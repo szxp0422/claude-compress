@@ -57,7 +57,7 @@ def main():
     cfg = Config()
     cfg.upstream_base_url = "http://127.0.0.1:9911"
     cfg.alias.enabled = True
-    cfg.alias.min_occurrences = 2
+    cfg.alias.min_occurrences = 6
     cfg.alias.min_length = 10
     cfg.checkpoint.enabled = False  # keep this test focused
     proxy = create_app(cfg)
@@ -71,7 +71,9 @@ def main():
     payload = {
         "model": "claude-sonnet-4-6", "max_tokens": 100,
         "messages": [{"role": "user", "content":
-            f"open {lp}; test {lp}; lint {lp}"}],
+            " ".join([f"open {lp}", f"test {lp}", f"lint {lp}",
+                    f"deploy {lp}", f"revert {lp}", f"edit {lp}",
+                    f"read {lp}", f"check {lp}"])}],
     }
     h = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01",
          "content-type": "application/json"}

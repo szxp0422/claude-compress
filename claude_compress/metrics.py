@@ -20,6 +20,7 @@ class Metrics:
         total_saved = max(0, tokens_in - tokens_out)
         pct = (total_saved / tokens_in * 100.0) if tokens_in else 0.0
         row = {
+            "kind": "estimate",
             "ts": time.time(),
             "session": session_id,
             "tokens_in": tokens_in,
@@ -38,6 +39,23 @@ class Metrics:
                 for r in stage_results
             ],
         }
+        self._write(row)
+        return row
+
+    def record_usage(self, session_id: str, usage, est_tokens_out: int = 0):
+        """Log the API's ground-truth usage. This is the number you cite as proof."""
+        row = {
+            "kind": "ground_truth",
+            "ts": time.time(),
+            "session": session_id,
+            "usage": usage.to_dict(),
+            "cost_usd": round(usage.cost(), 6),
+            "estimated_compressed_input": est_tokens_out,
+        }
+        self._write(row)
+        return row
+
+    def _write(self, row: dict):
         line = json.dumps(row)
         with _lock:
             try:
@@ -45,4 +63,3 @@ class Metrics:
                     f.write(line + "\n")
             except Exception:
                 pass
-        return row

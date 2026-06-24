@@ -67,7 +67,11 @@ class AliasConfig:
     # LOSSY-ish / risky. Replaces long repeated strings with short aliases and
     # injects a legend. Can confuse the model. Off by default.
     enabled: bool = False
-    min_occurrences: int = 4
+    # minimum occurrences before considering a string for aliasing.
+    # must be high enough for substitution savings to exceed legend overhead
+    # (header ~24 tok + ~11 tok/entry). For a typical path (~8 tok), break-even
+    # is ~6 occurrences. Default 8 gives a comfortable margin.
+    min_occurrences: int = 8
     min_length: int = 24
     max_aliases: int = 24
 

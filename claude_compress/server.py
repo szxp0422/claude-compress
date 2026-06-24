@@ -30,6 +30,7 @@ from .postprocess.responses import (
     record_assistant_turn,
 )
 from .state import StateStore
+from .usage import StreamingUsageAccumulator, parse_usage
 
 logger = logging.getLogger("ccomp")
 
@@ -132,6 +133,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         # --- forward + post-process ---------------------------------------
         if streaming:
             async def event_stream():
+                acc = StreamingUsageAccumulator()
                 async with httpx.AsyncClient(timeout=None) as client:
                     async with client.stream(
                         "POST", url, headers=up_headers, json=new_body
@@ -140,6 +142,10 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                             if line.startswith("data:"):
                                 payload = line[len("data:"):].strip()
                                 if payload and payload != "[DONE]":
+                                    try:
+                                        acc.feed(json.loads(payload))
+                                    except Exception:
+                                        pass
                                     payload = expand_sse_event(payload, state)
                                 yield f"data: {payload}\n\n"
                             elif line.startswith("event:"):
@@ -148,6 +154,13 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                                 continue
                             else:
                                 yield line + "\n"
+                # stream finished: log ground-truth usage
+                metrics.record_usage(state.session_id, acc.usage, est_tokens_out=tok_out)
+                logger.info(
+                    "session=%s REAL(stream) input=%d (cache_read=%d) output=%d",
+                    state.session_id, acc.usage.total_input,
+                    acc.usage.cache_read_input_tokens, acc.usage.output_tokens,
+                )
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -163,6 +176,15 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             resp_body = expand_response_body(resp_body, state)
             record_assistant_turn(resp_body, state)
             store.commit(state)
+            # GROUND TRUTH: log the real usage the API reported, not our estimate
+            real = parse_usage(resp_body)
+            metrics.record_usage(state.session_id, real, est_tokens_out=tok_out)
+            logger.info(
+                "session=%s REAL input=%d (cache_read=%d cache_write=%d) output=%d",
+                state.session_id, real.total_input,
+                real.cache_read_input_tokens, real.cache_creation_input_tokens,
+                real.output_tokens,
+            )
 
         return JSONResponse(resp_body, status_code=r.status_code)
 

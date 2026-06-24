@@ -85,22 +85,33 @@ def main():
     roles = [m["role"] for m in msgs]
     for a, b in zip(roles, roles[1:]):
         assert a != b, f"role alternation broken: {roles}"
-    # 4. alias stage round-trips when run in isolation on repetitive input
+    # 4. alias stage round-trips when run in isolation on repetitive input.
+    # NOTE: aliasing is only profitable when the substitution savings exceed
+    # the legend overhead (header + one entry line). For a ~8-token path
+    # the break-even is ~6 identical occurrences; we use 8 for a clear positive.
     from claude_compress.stages.alias import AliasStage
     from claude_compress.config import AliasConfig
     lp = "app/services/customer_success/orchestration/platform_runner.rb"
+    # Repeat the EXACT same path string 8 times in different plausible usages
+    reps = " ".join([
+        "open " + lp, "test " + lp, "lint " + lp, "deploy " + lp,
+        "revert " + lp, "edit " + lp, "read " + lp, "check " + lp,
+    ])
     alias_req = {"messages": [{"role": "user", "content": [{"type": "text",
-        "text": f"open {lp}; test {lp}; lint {lp}; deploy {lp}; revert {lp}"}]}]}
+        "text": reps}]}]}
     astate = SessionState(session_id="alias")
-    ares = AliasStage(AliasConfig(enabled=True)).apply(alias_req, astate)
-    assert astate.alias_legend, "expected aliases in isolation"
-    assert ares.saved > 0, "alias stage should save tokens here"
+    ares = AliasStage(AliasConfig(enabled=True, min_occurrences=6)).apply(alias_req, astate)
+    assert astate.alias_legend, "expected aliases when profitable"
+    assert ares.saved > 0, (
+        "alias stage must save tokens when path repeats 8x "
+        "(before=" + str(ares.tokens_before) + " after=" + str(ares.tokens_after) + ")"
+    )
     # round-trip: expanding an aliased response restores the original path
     from claude_compress.postprocess.responses import _expand
     alias = next(iter(astate.alias_legend))
-    assert _expand(f"done with {alias}", astate.alias_legend) == f"done with {lp}"
+    assert _expand("done with " + alias, astate.alias_legend) == "done with " + lp
     print("alias legend:", json.dumps(astate.alias_legend, indent=0)[:200])
-    print(f"alias stage saved {ares.saved} tokens in isolation")
+    print(f"alias stage saved {ares.saved} tokens in isolation (8 occurrences, min_occurrences=6)")
     print("roles:", roles)
     print("\nALL SAFETY CHECKS PASSED")
 
