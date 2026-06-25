@@ -147,6 +147,8 @@ def make_real_model_call(upstream_base_url: str) -> ModelCall:
         h["content-type"] = "application/json"
         with httpx.Client(timeout=120) as client:
             r = client.post(url, headers=h, json=request)
+            if r.status_code >= 400:
+                print("API error response:", r.text)
             r.raise_for_status()
             body = r.json()
         return body, parse_usage(body)

@@ -15,6 +15,8 @@ This is the genuinely-shippable version of "delta encoding" for a stateless API.
 """
 from __future__ import annotations
 
+import json
+
 from ..config import DeltaConfig
 from ..state import SessionState
 from ..tokens import content_to_text, count_request
@@ -23,7 +25,24 @@ from .base import Stage, StageResult
 
 
 def _mark(block: dict):
-    block["cache_control"] = {"type": "ephemeral"}
+    if "cache_control" not in block:
+        block["cache_control"] = {"type": "ephemeral"}
+
+def _has_any_cache_control(request: dict) -> bool:
+    """Check if the client already set cache_control anywhere in the request."""
+    system = request.get("system")
+    if isinstance(system, list):
+        if any(b.get("cache_control") for b in system if isinstance(b, dict)):
+            return True
+    for tool in request.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("cache_control"):
+            return True
+    for msg in request.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            if any(b.get("cache_control") for b in content if isinstance(b, dict)):
+                return True
+    return False
 
 
 class DeltaStage(Stage):
@@ -37,6 +56,10 @@ class DeltaStage(Stage):
 
     def apply(self, request: dict, state: SessionState) -> StageResult:
         before = count_request(request)
+        if _has_any_cache_control(request):
+            return StageResult(self.name, before, before,
+                               note="skipped: client already set cache_control blocks")
+
         budget = self.cfg.max_breakpoints
         placed = 0
 
@@ -77,11 +100,19 @@ class DeltaStage(Stage):
                         placed += 1
                         budget -= 1
 
-        # record the prefix hash for observability (delta detection)
-        prefix_text = content_to_text(request.get("messages", [{}])[0].get("content", "")) \
-            if request.get("messages") else ""
-        state.seen_hashes[content_hash(prefix_text)] = \
-            state.seen_hashes.get(content_hash(prefix_text), 0) + 1
+        # Hash the full stable prefix that the cache breakpoints protect:
+        # system + tools + every message except the final user turn.
+        parts: list[str] = []
+        sys_ = request.get("system")
+        if sys_:
+            parts.append(sys_ if isinstance(sys_, str) else json.dumps(sys_))
+        tools_ = request.get("tools")
+        if tools_:
+            parts.append(json.dumps(tools_))
+        for m in request.get("messages", [])[:-1]:
+            parts.append(content_to_text(m.get("content", "")))
+        h = content_hash("\n".join(parts))
+        state.seen_hashes[h] = state.seen_hashes.get(h, 0) + 1
 
         after = count_request(request)  # unchanged; this stage is lossless
         return StageResult(

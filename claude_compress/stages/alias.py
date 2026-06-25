@@ -15,10 +15,9 @@ Caveats that make this off-by-default:
 """
 from __future__ import annotations
 
-import copy
 import re
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from ..config import AliasConfig
 from ..state import SessionState
@@ -64,7 +63,7 @@ class AliasStage(Stage):
         return {s: c for s, c in counts.items() if c >= self.cfg.min_occurrences}
 
     def _profitable_aliases(
-        self, cands: Dict[str, int], header_cost: int
+        self, cands: Dict[str, int], header_cost: int, start_idx: int = 0
     ) -> List[Tuple[str, str, int]]:
         """Return [(alias, original, net_saving)] for strings where aliasing
         actually saves tokens after paying the legend overhead.
@@ -73,13 +72,14 @@ class AliasStage(Stage):
         greedy selection: sort by per-entry net saving (savings - entry_cost)
         and accumulate until adding the next alias would consume more than it
         saves.
+        start_idx offsets alias numbering so aliases never get reused across turns.
         """
         # rank by (per_use_saving * count - entry_cost), best first
         scored = []
         for i, (s, count) in enumerate(
             sorted(cands.items(), key=lambda kv: len(kv[0]) * kv[1], reverse=True)
         ):
-            alias = _alias_name(i)
+            alias = _alias_name(start_idx + i)
             pu = _per_use_saving(alias, s)
             entry = _entry_cost(alias, s)
             gross = pu * count
@@ -102,14 +102,19 @@ class AliasStage(Stage):
 
     def apply(self, request: dict, state: SessionState) -> StageResult:
         before = count_request(request)
-        blocks = iter_text_blocks(request, protect_last_n=0)
+        blocks = list(iter_text_blocks(request, protect_last_n=self.cfg.protect_last_n_messages))
         texts = [b.get("text", "") for (_, _, b) in blocks]
         cands = self._candidates(texts)
+
+        # strip strings already aliased in a previous turn
+        already_aliased = set(state.alias_legend.values())
+        cands = {s: c for s, c in cands.items() if s not in already_aliased}
+
         if not cands:
             return StageResult(self.name, before, before, note="no alias candidates")
 
         header_cost = count_text(_LEGEND_HEADER)
-        profitable = self._profitable_aliases(cands, header_cost)
+        profitable = self._profitable_aliases(cands, header_cost, start_idx=state.next_alias_index)
         if not profitable:
             return StageResult(
                 self.name, before, before,
@@ -117,18 +122,24 @@ class AliasStage(Stage):
                      f"legend overhead ({header_cost} tok header)"
             )
 
-        legend: Dict[str, str] = {alias: original for alias, original, _ in profitable}
+        new_legend: Dict[str, str] = {alias: original for alias, original, _ in profitable}
 
-        # apply substitutions to all text blocks
+        # full legend = prior aliases + new ones; apply all substitutions so
+        # existing aliases already in the text are preserved
+        full_legend = {**state.alias_legend, **new_legend}
+
+        # apply substitutions longest-first to prevent a shorter alias from
+        # corrupting a longer one that shares a prefix (e.g. /api before /api/users)
+        sorted_legend = sorted(full_legend.items(), key=lambda kv: len(kv[1]), reverse=True)
         for _, _, blk in blocks:
             txt = blk.get("text", "")
-            for alias, original in legend.items():
+            for alias, original in sorted_legend:
                 if original in txt:
                     txt = txt.replace(original, alias)
             blk["text"] = txt
 
-        # build and prepend the legend block
-        legend_lines = "\n".join(f"{a} = {o}" for a, o in legend.items())
+        # build and prepend the legend block (only new entries this turn)
+        legend_lines = "\n".join(f"{a} = {o}" for a, o in new_legend.items())
         legend_block = {
             "type": "text",
             "text": _LEGEND_HEADER + legend_lines,
@@ -143,12 +154,13 @@ class AliasStage(Stage):
             if isinstance(content, list):
                 content.insert(0, legend_block)
 
-        state.alias_legend.update(legend)
+        state.alias_legend.update(new_legend)
+        state.next_alias_index += len(new_legend)
         after = count_request(request)
         return StageResult(
             self.name,
             before,
             after,
-            note=f"aliased {len(legend)} string(s), net ~{before - after} tok",
-            detail={"aliases": len(legend)},
+            note=f"aliased {len(new_legend)} new string(s), net ~{before - after} tok",
+            detail={"aliases": len(new_legend)},
         )

@@ -13,7 +13,8 @@ the injected `summarize_fn` (kept out of this module so it stays testable).
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import hashlib
+from typing import Callable, Optional
 
 from ..config import CheckpointConfig
 from ..state import SessionState
@@ -25,17 +26,23 @@ SummarizeFn = Callable[[str, int, str], str]
 
 
 def _local_extractive_summary(text: str, target_tokens: int) -> str:
-    """Dependency-free fallback: keep the first and last slices of each turn.
+    """Dependency-free fallback: keep head context + tail (recent decisions).
 
+    Head gives setup/goal context; tail gives the most recent state of work.
     Crude but deterministic, used when no summarizer side-call is available
     (e.g. in tests). Production path uses the model side-call.
     """
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not paras:
         return text[: target_tokens * 4]
-    head = paras[: max(1, len(paras) // 3)]
+    n_head = max(1, len(paras) // 4)
+    n_tail = max(1, len(paras) // 2)
+    head = paras[:n_head]
+    tail_start = max(n_head, len(paras) - n_tail)
+    tail = paras[tail_start:]
+    selected = head + tail
     out, used = [], 0
-    for p in head:
+    for p in selected:
         t = count_text(p)
         if used + t > target_tokens:
             break
@@ -84,19 +91,37 @@ class CheckpointStage(Stage):
             role = m.get("role", "?")
             joined.append(f"[{role}]\n{content_to_text(m.get('content', ''))}")
         blob = "\n\n".join(joined)
+        old_tokens = count_text(blob)
 
-        target = self.cfg.summary_target_tokens
-        if self.summarize_fn is not None:
-            try:
-                summary = self.summarize_fn(blob, target, self.cfg.summarizer_model)
-            except Exception as e:  # never let summarisation break the request
-                summary = _local_extractive_summary(blob, target)
-                note_src = f"fallback (side-call failed: {type(e).__name__})"
-            else:
-                note_src = "model side-call"
+        # ROI gate: don't pay for a side-call if the old bucket is already small
+        # enough that summarising it would save little or nothing.
+        threshold = self.cfg.summary_target_tokens * self.cfg.min_compression_ratio
+        if old_tokens < threshold:
+            return StageResult(
+                self.name, before, before,
+                note=f"old bucket too small ({old_tokens} tok < {threshold:.0f} threshold)",
+            )
+
+        # Skip the expensive side-call if this exact prefix was already summarised.
+        # The client sends the full uncompressed history every turn, so without this
+        # guard we'd pay for a Haiku call on every turn once the conversation is long.
+        blob_hash = hashlib.sha1(blob.encode()).hexdigest()[:16]
+        if state.checkpoint_hash == blob_hash and state.checkpoint_text:
+            summary = state.checkpoint_text
+            note_src = "cached (unchanged prefix)"
         else:
-            summary = _local_extractive_summary(blob, target)
-            note_src = "local extractive"
+            target = self.cfg.summary_target_tokens
+            if self.summarize_fn is not None:
+                try:
+                    summary = self.summarize_fn(blob, target, self.cfg.summarizer_model)
+                    note_src = "model side-call"
+                except Exception as e:  # never let summarisation break the request
+                    summary = _local_extractive_summary(blob, target)
+                    note_src = f"fallback (side-call failed: {type(e).__name__})"
+            else:
+                summary = _local_extractive_summary(blob, target)
+                note_src = "local extractive"
+            state.checkpoint_hash = blob_hash
 
         checkpoint_msg = {
             "role": "user",

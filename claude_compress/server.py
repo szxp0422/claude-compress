@@ -13,6 +13,8 @@ The checkpoint summariser reuses those same credentials for a cheap side-call.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import json
 import logging
 from typing import Optional
@@ -33,6 +35,7 @@ from .state import StateStore
 from .usage import StreamingUsageAccumulator, parse_usage
 
 logger = logging.getLogger("ccomp")
+_RECORD_PATH = os.getenv("CCOMP_RECORD")
 
 # headers we must forward upstream; hop-by-hop and host are dropped
 _FORWARD_HEADERS = {
@@ -89,7 +92,11 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     cfg = cfg or load_config()
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO))
     app = FastAPI(title="claude-compress proxy")
-    store = StateStore(persist_path=None)
+    store = StateStore(
+        persist_path=None,
+        max_sessions=cfg.max_sessions,
+        session_ttl_seconds=cfg.session_ttl_seconds,
+    )
     metrics = Metrics(cfg.metrics_path)
     app.state.cfg = cfg
 
@@ -113,7 +120,11 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         # --- input pipeline ------------------------------------------------
         state = store.get(req_body)
         pipeline = Pipeline(cfg, summarize_fn=make_summarizer(cfg, headers))
-        new_body, results, tok_in, tok_out = pipeline.run(req_body, state)
+        # Run in a thread so the blocking summarizer side-call (sync httpx)
+        # doesn't stall the asyncio event loop during checkpoint compression.
+        new_body, results, tok_in, tok_out = await asyncio.to_thread(
+            pipeline.run, req_body, state
+        )
         store.commit(state)
         metric_row = metrics.record(
             state.session_id, results, tok_in, tok_out, streaming
@@ -134,33 +145,48 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         if streaming:
             async def event_stream():
                 acc = StreamingUsageAccumulator()
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream(
-                        "POST", url, headers=up_headers, json=new_body
-                    ) as r:
-                        async for line in r.aiter_lines():
-                            if line.startswith("data:"):
-                                payload = line[len("data:"):].strip()
-                                if payload and payload != "[DONE]":
-                                    try:
-                                        acc.feed(json.loads(payload))
-                                    except Exception:
-                                        pass
-                                    payload = expand_sse_event(payload, state)
-                                yield f"data: {payload}\n\n"
-                            elif line.startswith("event:"):
-                                yield line + "\n"
-                            elif line == "":
-                                continue
-                            else:
-                                yield line + "\n"
-                # stream finished: log ground-truth usage
-                metrics.record_usage(state.session_id, acc.usage, est_tokens_out=tok_out)
-                logger.info(
-                    "session=%s REAL(stream) input=%d (cache_read=%d) output=%d",
-                    state.session_id, acc.usage.total_input,
-                    acc.usage.cache_read_input_tokens, acc.usage.output_tokens,
-                )
+                collected_text = ""
+                try:
+                    async with httpx.AsyncClient(timeout=None) as client:
+                        async with client.stream(
+                            "POST", url, headers=up_headers, json=new_body
+                        ) as r:
+                            async for line in r.aiter_lines():
+                                if line.startswith("data:"):
+                                    payload = line[len("data:"):].strip()
+                                    if payload and payload != "[DONE]":
+                                        try:
+                                            obj = json.loads(payload)
+                                            acc.feed(obj)
+                                            payload = expand_sse_event(payload, state)
+                                            if obj.get("type") == "content_block_delta":
+                                                try:
+                                                    collected_text += json.loads(payload).get("delta", {}).get("text", "")
+                                                except Exception:
+                                                    collected_text += obj.get("delta", {}).get("text", "")
+                                        except Exception:
+                                            pass
+                                    yield f"data: {payload}\n\n"
+                                elif line.startswith("event:"):
+                                    yield line + "\n"
+                                elif line.startswith(":"):
+                                    yield line + "\n"  # SSE keep-alive / comment
+                                elif line == "":
+                                    continue
+                                else:
+                                    yield line + "\n"
+                finally:
+                    # Runs on clean finish, client disconnect, or upstream error.
+                    fake_resp = {"content": [{"type": "text", "text": collected_text}]}
+                    record_assistant_turn(fake_resp, state)
+                    store.commit(state)
+                    metrics.record_usage(state.session_id, acc.usage, est_tokens_out=tok_out)
+                    _record(state.session_id, req_body, fake_resp)
+                    logger.info(
+                        "session=%s REAL(stream) input=%d (cache_read=%d) output=%d",
+                        state.session_id, acc.usage.total_input,
+                        acc.usage.cache_read_input_tokens, acc.usage.output_tokens,
+                    )
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -176,6 +202,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             resp_body = expand_response_body(resp_body, state)
             record_assistant_turn(resp_body, state)
             store.commit(state)
+            _record(state.session_id, req_body, resp_body)
             # GROUND TRUTH: log the real usage the API reported, not our estimate
             real = parse_usage(resp_body)
             metrics.record_usage(state.session_id, real, est_tokens_out=tok_out)
@@ -189,6 +216,22 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         return JSONResponse(resp_body, status_code=r.status_code)
 
     return app
+
+def _record(session_id: str, req_body: dict, resp_body: dict):
+    if not _RECORD_PATH:
+        return
+    import time
+    row = {
+        "ts": time.time(),
+        "session": session_id,
+        "request": req_body,
+        "response": resp_body,
+    }
+    try:
+        with open(_RECORD_PATH, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
 
 
 app = create_app()

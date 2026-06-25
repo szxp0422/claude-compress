@@ -22,6 +22,11 @@ from ..state import SessionState
 from ..tokens import count_request, count_text
 from .base import Stage, StageResult, iter_text_blocks
 
+# Marker injected by CheckpointStage — dedup must never treat this synthetic
+# message as a "first occurrence" anchor; doing so would cause subsequent real
+# messages (which discuss the same topics as the summary) to be dropped.
+_CHECKPOINT_MARKER = "=== CONVERSATION CHECKPOINT"
+
 
 class DedupStage(Stage):
     name = "semantic_dedup"
@@ -39,6 +44,7 @@ class DedupStage(Stage):
             (mi, bi, blk)
             for (mi, bi, blk) in blocks
             if count_text(blk.get("text", "")) >= self.cfg.min_block_tokens
+            and _CHECKPOINT_MARKER not in blk.get("text", "")
         ]
         if len(candidates) < 2:
             return StageResult(self.name, before, before, note="nothing to dedup")
@@ -46,14 +52,16 @@ class DedupStage(Stage):
         texts = [blk["text"] for (_, _, blk) in candidates]
         vecs = embeddings.embed(texts)
 
+        # Compute the full pairwise similarity matrix in one BLAS call instead
+        # of calling cosine() per pair. vecs are L2-normalised so dot product
+        # equals cosine similarity. For typical conversation lengths (n < 100)
+        # this is orders of magnitude faster than the Python inner loop.
+        sims = vecs @ vecs.T  # shape (n, n)
+
         kept: List[int] = []
         dropped = 0
         for i in range(len(candidates)):
-            is_dup = False
-            for j in kept:
-                if embeddings.cosine(vecs[i], vecs[j]) >= self.cfg.threshold:
-                    is_dup = True
-                    break
+            is_dup = any(sims[i, j] >= self.cfg.threshold for j in kept)
             if is_dup:
                 _, _, blk = candidates[i]
                 blk["text"] = "[redundant context removed by ccomp]"

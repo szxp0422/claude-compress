@@ -1,37 +1,25 @@
-"""Token counting.
+"""Token counting via tiktoken (cl100k_base).
 
 We can't run Claude's exact tokenizer locally, so this is an approximation
 used only for *relative* measurement (how much a stage saved). It is not used
-for billing or to make correctness-critical decisions.
-
-Backends, in order of preference:
-  1. tiktoken (cl100k_base) if installed -- a decent proxy for English+code.
-  2. A char/word heuristic fallback that needs no dependencies.
+for billing or to make correctness-critical decisions. tiktoken is accurate
+for English+code and is a required dependency.
 """
 from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any
 
-try:  # optional
-    import tiktoken
+import tiktoken
 
-    _ENC = tiktoken.get_encoding("cl100k_base")
-except Exception:  # pragma: no cover - fallback path
-    _ENC = None
+_ENC = tiktoken.get_encoding("cl100k_base")
 
 
 def count_text(text: str) -> int:
-    """Approximate token count for a single string."""
+    """Token count for a single string via tiktoken cl100k_base."""
     if not text:
         return 0
-    if _ENC is not None:
-        return len(_ENC.encode(text))
-    # Heuristic: ~4 chars/token for prose, but punctuation/code skews lower.
-    # Blend char and whitespace-word estimates for stability.
-    char_est = len(text) / 4.0
-    word_est = len(text.split()) * 1.3
-    return int(round((char_est + word_est) / 2))
+    return len(_ENC.encode(text))
 
 
 def _block_text(block: Any) -> str:

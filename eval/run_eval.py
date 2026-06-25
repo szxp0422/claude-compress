@@ -42,10 +42,10 @@ def _aggregate(results: List[TaskResult]):
             c_in.append(t.compressed_usage.total_input)
             b_cost.append(t.baseline_usage.cost())
             c_cost.append(t.compressed_usage.cost())
-        bs, cs = r.final_scores()
-        if bs is not None and cs is not None:
-            b_q.append(bs)
-            c_q.append(cs)
+        for t in r.turns:
+            if t.baseline_score is not None and t.compressed_score is not None:
+                b_q.append(t.baseline_score)
+                c_q.append(t.compressed_score)
     return b_in, c_in, b_cost, c_cost, b_q, c_q
 
 
@@ -103,6 +103,7 @@ def main():
     ap.add_argument("--ablate", action="store_true", help="also run per-stage ablations")
     ap.add_argument("--margin", type=float, default=0.03)
     ap.add_argument("--out", default="eval_report.md")
+    ap.add_argument("--judge-model", default="claude-sonnet-4-6",help="model to use as pairwise judge")
     args = ap.parse_args()
 
     tasks = load_tasks(args.tasks)
@@ -122,8 +123,33 @@ def main():
                  "> Live run against the real API. Numbers are ground truth."),
                 ""]
 
+    def make_judge_call(judge_model, headers):
+        import httpx
+        def judge(prompt: str) -> str:
+            body = {
+                "model": judge_model,
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            h = dict(headers)
+            h["content-type"] = "application/json"
+            with httpx.Client(timeout=60) as client:
+                r = client.post(
+                    args.upstream.rstrip("/") + "/v1/messages",
+                    headers=h, json=body
+                )
+                r.raise_for_status()
+                data = r.json()
+            return "".join(
+                b.get("text", "") for b in data.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return judge
+
+    judge_call = make_judge_call(args.judge_model, headers) if not args.mock else None
+
     full_cfg = Config()
-    results = run_suite(tasks, full_cfg, model_call, headers=headers)
+    results = run_suite(tasks, full_cfg, model_call, judge_call=judge_call, headers=headers)
     sections.append(build_report("Full pipeline (default config)", results, args.margin))
 
     if args.ablate:
@@ -136,7 +162,7 @@ def main():
         for label, (attr, val) in ablations.items():
             cfg = Config()
             setattr(getattr(cfg, attr), "enabled", val)
-            res = run_suite(tasks, cfg, model_call, headers=headers)
+            res = run_suite(tasks, cfg, model_call, judge_call=judge_call, headers=headers)
             sections.append(build_report(f"Ablation: {label}", res, args.margin))
 
     report = "\n".join(sections)

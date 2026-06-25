@@ -3,7 +3,7 @@ fastapi>=0.110
 uvicorn>=0.27
 httpx>=0.27
 numpy>=1.24
+tiktoken>=0.7.0
 
 # optional, strongly recommended for real semantic behaviour:
 #   pip install sentence-transformers   # real embeddings for dedup/eigencontext
-#   pip install tiktoken                # closer token counts than the heuristic

@@ -13,7 +13,6 @@ one more reason that stage defaults to off.
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from typing import List
 
@@ -70,4 +69,6 @@ def embed(texts: List[str]) -> np.ndarray:
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        raise ValueError(f"embedding dimension mismatch: {a.shape} vs {b.shape}")
     return float(np.dot(a, b))

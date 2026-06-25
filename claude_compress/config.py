@@ -10,9 +10,12 @@ Override via environment (CCOMP_*) or a JSON file passed to load_config().
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +39,9 @@ class CheckpointConfig:
     keep_recent_messages: int = 8
     # target token budget for the generated summary checkpoint
     summary_target_tokens: int = 600
+    # only compress if old-bucket tokens exceed summary_target_tokens by at least
+    # this multiple; prevents summarising 700 tokens down to 600 (net loss)
+    min_compression_ratio: float = 2.0
     # model used for the cheap summarisation side-call
     summarizer_model: str = "claude-haiku-4-5-20251001"
 
@@ -74,6 +80,9 @@ class AliasConfig:
     min_occurrences: int = 8
     min_length: int = 24
     max_aliases: int = 24
+    # never alias-substitute within the last N messages (the live working set),
+    # matching the same safety boundary used by dedup
+    protect_last_n_messages: int = 4
 
 
 @dataclass
@@ -90,6 +99,9 @@ class Config:
     listen_port: int = 8787
     metrics_path: str = "./ccomp_metrics.jsonl"
     log_level: str = "INFO"
+    # session store limits — evict old/excess sessions to bound memory use
+    max_sessions: int = 500
+    session_ttl_seconds: float = 86400.0
 
     dedup: DedupConfig = field(default_factory=DedupConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -104,6 +116,13 @@ class Config:
 
 def _coerce(dc_cls, data: dict):
     fields = {f for f in dc_cls.__dataclass_fields__}
+    unknown = set(data.keys()) - fields
+    if unknown:
+        _logger.warning(
+            "config: unknown keys in %s section: %s (ignored)",
+            dc_cls.__name__,
+            sorted(unknown),
+        )
     return dc_cls(**{k: v for k, v in data.items() if k in fields})
 
 
@@ -113,7 +132,7 @@ def load_config(path: Optional[str] = None) -> Config:
         with open(path) as f:
             raw = json.load(f)
         for key in ("upstream_base_url", "listen_host", "listen_port",
-                    "metrics_path", "log_level"):
+                    "metrics_path", "log_level", "max_sessions", "session_ttl_seconds"):
             if key in raw:
                 setattr(cfg, key, raw[key])
         if "dedup" in raw:
@@ -135,4 +154,8 @@ def load_config(path: Optional[str] = None) -> Config:
     cfg.listen_port = int(os.getenv("CCOMP_PORT", cfg.listen_port))
     cfg.metrics_path = os.getenv("CCOMP_METRICS", cfg.metrics_path)
     cfg.log_level = os.getenv("CCOMP_LOG_LEVEL", cfg.log_level)
+    cfg.max_sessions = int(os.getenv("CCOMP_MAX_SESSIONS", cfg.max_sessions))
+    cfg.session_ttl_seconds = float(
+        os.getenv("CCOMP_SESSION_TTL", cfg.session_ttl_seconds)
+    )
     return cfg

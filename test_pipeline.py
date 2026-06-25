@@ -100,7 +100,8 @@ def main():
     alias_req = {"messages": [{"role": "user", "content": [{"type": "text",
         "text": reps}]}]}
     astate = SessionState(session_id="alias")
-    ares = AliasStage(AliasConfig(enabled=True, min_occurrences=6)).apply(alias_req, astate)
+    # protect_last_n_messages=0: isolation test exercises core alias logic, not the window guard
+    ares = AliasStage(AliasConfig(enabled=True, min_occurrences=6, protect_last_n_messages=0)).apply(alias_req, astate)
     assert astate.alias_legend, "expected aliases when profitable"
     assert ares.saved > 0, (
         "alias stage must save tokens when path repeats 8x "

@@ -7,7 +7,7 @@
 
   "delta":        { "enabled": true,  "max_breakpoints": 4 },
   "dedup":        { "enabled": true,  "threshold": 0.93, "protect_last_n_messages": 4, "min_block_tokens": 40 },
-  "checkpoint":   { "enabled": true,  "trigger_tokens": 12000, "keep_recent_messages": 8, "summary_target_tokens": 600, "summarizer_model": "claude-haiku-4-5-20251001" },
+  "checkpoint":   { "enabled": true,  "trigger_tokens": 40000, "keep_recent_messages": 8, "summary_target_tokens": 800, "min_compression_ratio": 2.0, "summarizer_model": "claude-haiku-4-5-20251001" },
 
   "eigencontext": { "enabled": false, "coverage": 0.92, "marker": "<<REF>>", "protect_last_n_messages": 4 },
   "alias":        { "enabled": false, "min_occurrences": 4, "min_length": 24, "max_aliases": 24 },
