@@ -8,15 +8,22 @@ Order matters:
   5. alias           -- substitute repeated long strings (risky, opt-in)
   6. delta           -- LAST: insert cache breakpoints on the final shape
                         (must run last so breakpoints sit on stable content)
+
+Dynamic tiering:
+  TINY     (< 2000 tokens):  pass through (nothing to compress)
+  SHORT    (< 4000 tokens):  cache breakpoints only (no overhead)
+  TOOL-HEAVY (>30% tool results): skip alias/eigencontext (they don't understand
+                                   tool_result structure)
+  NORMAL:  all enabled stages
 """
 from __future__ import annotations
 
 import copy
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from .config import Config
 from .state import SessionState
-from .stages.base import StageResult
+from .stages.base import StageResult, count_tool_result_tokens
 from .stages.alias import AliasStage
 from .stages.checkpoint import CheckpointStage, SummarizeFn
 from .stages.dedup import DedupStage
@@ -38,14 +45,36 @@ class Pipeline:
             DeltaStage(cfg.delta),
         ]
 
+    def _select_stages(self, request: dict) -> List:
+        """Return the stages to run for this specific request based on tier."""
+        total = count_request(request)
+
+        if total < self.cfg.tier.tiny_threshold:
+            # too small to benefit from any compression
+            return [s for s in self.stages if s.name == "delta_cache_breakpoints" and s.enabled()]
+
+        if total < self.cfg.tier.short_threshold:
+            # small session — only lossless cache stage, avoid any overhead
+            return [s for s in self.stages if s.name == "delta_cache_breakpoints" and s.enabled()]
+
+        tool_tokens = count_tool_result_tokens(request)
+        tool_ratio = tool_tokens / total if total else 0.0
+
+        if tool_ratio > 0.30:
+            # tool-heavy: skip alias and eigencontext — they don't understand
+            # tool_result structure and add overhead without benefit
+            safe_for_tools = {"semantic_dedup", "checkpoint_compression", "delta_cache_breakpoints"}
+            return [s for s in self.stages if s.name in safe_for_tools and s.enabled()]
+
+        # normal prose/code session: run all enabled stages
+        return [s for s in self.stages if s.enabled()]
+
     def run(self, request: dict, state: SessionState):
         """Returns (new_request, [StageResult], tokens_in, tokens_out)."""
         tokens_in = count_request(request)
         work = copy.deepcopy(request)
         results: List[StageResult] = []
-        for stage in self.stages:
-            if not stage.enabled():
-                continue
+        for stage in self._select_stages(request):
             try:
                 res = stage.apply(work, state)
                 results.append(res)

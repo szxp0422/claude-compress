@@ -76,3 +76,78 @@ def text_blocks_in_message(msg: dict) -> List[dict]:
     if isinstance(content, list):
         return [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
     return []
+
+
+def extract_tool_result_text(block: dict) -> str:
+    """Extract plain text from a tool_result block.
+
+    tool_result content can be a plain string or a list of typed sub-blocks.
+    Returns empty string for non-tool_result blocks or blocks with no text.
+    """
+    if not isinstance(block, dict) or block.get("type") != "tool_result":
+        return ""
+    content = block.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for sub in content:
+            if isinstance(sub, dict) and sub.get("type") == "text":
+                parts.append(sub.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
+
+def iter_all_text(
+    request: dict, protect_last_n: int = 0, include_tool_results: bool = True
+) -> List[Tuple[int, int, str, str]]:
+    """Yield (message_index, block_index, text, source_type) for every block
+    that contains readable text, including tool_result blocks.
+
+    source_type is one of: 'text', 'tool_result'
+
+    Used by dedup and checkpoint so they operate on tool-heavy sessions too.
+    Never yields tool_use or image blocks (no useful plain text to extract).
+    Skips the last protect_last_n messages.
+    """
+    msgs = request.get("messages", [])
+    cutoff = len(msgs) - protect_last_n
+    out: List[Tuple[int, int, str, str]] = []
+    for mi, msg in enumerate(msgs):
+        if mi >= cutoff:
+            break
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                out.append((mi, 0, content, "text"))
+            continue
+        if isinstance(content, list):
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = block.get("text", "")
+                    if text.strip():
+                        out.append((mi, bi, text, "text"))
+                elif btype == "tool_result" and include_tool_results:
+                    text = extract_tool_result_text(block)
+                    if text.strip():
+                        out.append((mi, bi, text, "tool_result"))
+    return out
+
+
+def count_tool_result_tokens(request: dict) -> int:
+    """Count tokens that live inside tool_result blocks.
+
+    Used by the tier selector to detect tool-heavy sessions.
+    """
+    from ..tokens import count_text
+    total = 0
+    for msg in request.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    total += count_text(extract_tool_result_text(block))
+    return total

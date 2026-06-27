@@ -93,6 +93,15 @@ class StateMachineConfig:
 
 
 @dataclass
+class TierConfig:
+    # Token thresholds for the dynamic compression tier selector.
+    # Sessions below tiny_threshold are passed through unchanged.
+    tiny_threshold: int = 2000
+    # Sessions below short_threshold get cache breakpoints only (no lossy ops).
+    short_threshold: int = 4000
+
+
+@dataclass
 class Config:
     upstream_base_url: str = "https://api.anthropic.com"
     listen_host: str = "127.0.0.1"
@@ -109,6 +118,7 @@ class Config:
     eigencontext: EigencontextConfig = field(default_factory=EigencontextConfig)
     alias: AliasConfig = field(default_factory=AliasConfig)
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
+    tier: TierConfig = field(default_factory=TierConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -147,6 +157,8 @@ def load_config(path: Optional[str] = None) -> Config:
             cfg.alias = _coerce(AliasConfig, raw["alias"])
         if "state_machine" in raw:
             cfg.state_machine = _coerce(StateMachineConfig, raw["state_machine"])
+        if "tier" in raw:
+            cfg.tier = _coerce(TierConfig, raw["tier"])
 
     # env overrides for the few operational knobs
     cfg.upstream_base_url = os.getenv("CCOMP_UPSTREAM", cfg.upstream_base_url)

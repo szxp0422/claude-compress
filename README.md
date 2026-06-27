@@ -26,7 +26,7 @@ The Messages API is stateless, so middleware cannot hide context from Claude. Ea
 | Stage | Default | Lossy? | What it does |
 |---|---|---|---|
 | `delta_cache_breakpoints` | **on** | no | Inserts `cache_control` breakpoints on the stable prefix (system, tools, old turns). Cuts **cost** (cached input is billed at a discount), not prompt size. Steps aside if the client already manages its own cache breakpoints. |
-| `semantic_dedup` | **on** | safe | Drops history text blocks whose meaning duplicates an earlier block (cosine similarity ≥ threshold). Never touches the last N messages or tool/image blocks. |
+| `semantic_dedup` | **on** | safe | Drops history text blocks whose meaning duplicates an earlier block. Threshold is computed per-session via Otsu's method (finds the natural valley in the pairwise similarity distribution) and pulled down further under token pressure. Never touches the last N messages or tool/image blocks. |
 | `checkpoint_compression` | **on** | safe | Once a conversation passes a token threshold, folds the oldest turns into one compact summary via a cheap Haiku side-call. Highest-value stage for long sessions — accounts for roughly half of total size reduction. |
 | `eigencontext` | off | **lossy** | Greedy max-coverage sentence selection over `<<REF>>`-tagged reference blocks only. Disabled by default: dropping context from a coding agent is risky. |
 | `alias_substitution` | off | **risky** | Replaces long repeated strings with short aliases and a legend; expands them back in the response. Only profitable when a string repeats 8+ times; marginal wins on most sessions. |
@@ -64,7 +64,15 @@ This guarantees at least a 2:1 compression ratio on the summarised portion, ensu
 
 ### Semantic dedup bound
 
-Dedup solves an approximate set cover problem. The greedy algorithm retains at most $O(\log n)$ times the optimal minimum set. Any removed block has cosine similarity ≥ 0.93 to a retained block, bounding information loss per removed block at $1 - 0.93^2 \approx 13\%$ of that block's directional information content.
+Dedup solves an approximate set cover problem. The greedy algorithm retains at most $O(\log n)$ times the optimal minimum set.
+
+The similarity threshold is computed per-session rather than set globally. Otsu's method finds the threshold $\tau^*$ that maximises between-class variance on the histogram of all pairwise cosine similarities — the natural valley between the "clearly different" and "near-duplicate" clusters in the current session. A pressure term then pulls the threshold down as the context window fills:
+
+$$\tau = \text{clip}(\tau^* - 0.13 \cdot \max(0, 2(u - 0.5)),\ 0.80,\ 0.97)$$
+
+where $u = |C_t| / C_{limit}$ is current utilisation. At $u \leq 0.5$ there is no adjustment; at $u = 1.0$ the threshold drops by 0.13. With hash-based embeddings (lexical fallback) the threshold is additionally capped at 0.90 to avoid false dedup.
+
+Any removed block has cosine similarity ≥ $\tau$ to a retained block, so information loss per removed block is bounded by $1 - \tau^2$. At the minimum allowed threshold $\tau = 0.80$ this is $\leq 36\%$ of that block's directional information content; at the typical Otsu-computed value near 0.93 it is $\leq 13\%$.
 
 ### Why the test is conservative
 
@@ -139,7 +147,7 @@ Key knobs:
 | `checkpoint.trigger_tokens` | `40000` | Lower for more aggressive summarisation |
 | `checkpoint.keep_recent_messages` | `8` | Verbatim turns always preserved |
 | `checkpoint.min_compression_ratio` | `2.0` | ROI gate: skip if summary isn't 2× smaller |
-| `dedup.threshold` | `0.93` | Cosine similarity floor for duplicate detection |
+| `dedup.threshold` | `0.93` | Fallback similarity floor used only when fewer than 3 blocks exist; otherwise Otsu's method picks the threshold automatically |
 
 Environment overrides: `CCOMP_UPSTREAM`, `CCOMP_HOST`, `CCOMP_PORT`, `CCOMP_METRICS`, `CCOMP_LOG_LEVEL`.
 

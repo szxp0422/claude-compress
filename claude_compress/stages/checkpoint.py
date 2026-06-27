@@ -21,8 +21,31 @@ from ..state import SessionState
 from ..tokens import content_to_text, count_request, count_text
 from .base import Stage, StageResult
 
-# summarize_fn(text, target_tokens, model) -> summary string
-SummarizeFn = Callable[[str, int, str], str]
+# summarize_fn(text, target_tokens, model, *, tool_heavy=False) -> summary string
+SummarizeFn = Callable[..., str]
+
+
+def _is_tool_heavy(msgs: list) -> bool:
+    """Return True if this message slice is dominated by tool_result blocks.
+
+    A session is 'tool-heavy' when more than 30% of its messages contain
+    tool_result content — typical of real Claude Code sessions where the
+    model reads files, runs bash commands, and searches the codebase.
+    """
+    if not msgs:
+        return False
+    tool_count = 0
+    for m in msgs:
+        content = m.get("content", [])
+        if isinstance(content, list):
+            if any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                tool_count += 1
+        elif isinstance(content, str) and "[tool_result]" in content:
+            tool_count += 1
+    return (tool_count / len(msgs)) > 0.30
 
 
 def _local_extractive_summary(text: str, target_tokens: int) -> str:
@@ -68,9 +91,6 @@ class CheckpointStage(Stage):
             return StageResult(self.name, before, before, note="under trigger")
 
         keep = self.cfg.keep_recent_messages
-        if len(msgs) <= keep + 1:
-            return StageResult(self.name, before, before, note="too few messages")
-
         # the slice we will compress: everything except the recent tail
         old = list(msgs[:-keep]) if keep > 0 else list(msgs)
         recent = list(msgs[-keep:]) if keep > 0 else []
@@ -111,10 +131,13 @@ class CheckpointStage(Stage):
             note_src = "cached (unchanged prefix)"
         else:
             target = self.cfg.summary_target_tokens
+            tool_heavy = _is_tool_heavy(old)
             if self.summarize_fn is not None:
                 try:
-                    summary = self.summarize_fn(blob, target, self.cfg.summarizer_model)
-                    note_src = "model side-call"
+                    summary = self.summarize_fn(
+                        blob, target, self.cfg.summarizer_model, tool_heavy=tool_heavy
+                    )
+                    note_src = "model side-call" + (" (tool-aware)" if tool_heavy else "")
                 except Exception as e:  # never let summarisation break the request
                     summary = _local_extractive_summary(blob, target)
                     note_src = f"fallback (side-call failed: {type(e).__name__})"

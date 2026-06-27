@@ -41,7 +41,7 @@ def _greedy_cover(vecs: np.ndarray, coverage: float) -> List[int]:
     best_cov = np.zeros(n)
     chosen: List[int] = []
     total_target = coverage * n
-    while chosen and best_cov.sum() >= total_target or len(chosen) < n:
+    while len(chosen) < n:
         # pick sentence maximising marginal gain
         gains = np.maximum(sim, best_cov[None, :]).sum(axis=1) - best_cov.sum()
         for c in chosen:
