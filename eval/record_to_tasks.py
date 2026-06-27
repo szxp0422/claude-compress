@@ -1,10 +1,13 @@
 """Convert recorded proxy sessions into eval task JSONL.
 
 Usage:
-    python -m eval.record_to_tasks --input sessions.jsonl --out eval/my_tasks.jsonl
+    python -m eval.record_to_tasks --input sessions/     # directory (new format)
+    python -m eval.record_to_tasks --input sessions.jsonl  # single file (legacy)
 """
 import argparse
+import glob
 import json
+import os
 import re
 from collections import defaultdict
 
@@ -27,14 +30,26 @@ def _strip_cache_control(obj):
             _strip_cache_control(v)
 
 
+def _iter_rows(input_path: str):
+    if os.path.isdir(input_path):
+        for jsonl_file in sorted(glob.glob(os.path.join(input_path, "*.jsonl"))):
+            with open(jsonl_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+    else:
+        with open(input_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
+
 def convert(input_path: str, out_path: str, min_turns: int = 2):
     sessions = defaultdict(list)
-    with open(input_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                row = json.loads(line)
-                sessions[row["session"]].append(row)
+    for row in _iter_rows(input_path):
+        sessions[row["session"]].append(row)
 
     tasks = []
     for session_id, rows in sessions.items():

@@ -35,7 +35,7 @@ from .state import StateStore
 from .usage import StreamingUsageAccumulator, parse_usage
 
 logger = logging.getLogger("ccomp")
-_RECORD_PATH = os.getenv("CCOMP_RECORD")
+_RECORD_DIR = os.getenv("CCOMP_RECORD_DIR") or os.getenv("CCOMP_RECORD")
 
 # headers we must forward upstream; hop-by-hop and host are dropped
 _FORWARD_HEADERS = {
@@ -218,7 +218,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     return app
 
 def _record(session_id: str, req_body: dict, resp_body: dict):
-    if not _RECORD_PATH:
+    if not _RECORD_DIR:
         return
     import time
     row = {
@@ -228,7 +228,9 @@ def _record(session_id: str, req_body: dict, resp_body: dict):
         "response": resp_body,
     }
     try:
-        with open(_RECORD_PATH, "a") as f:
+        os.makedirs(_RECORD_DIR, exist_ok=True)
+        path = os.path.join(_RECORD_DIR, f"{session_id}.jsonl")
+        with open(path, "a") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
         pass
