@@ -71,9 +71,20 @@ def convert(input_path: str, out_path: str, min_turns: int = 2):
             # flatten content blocks to plain text
             content = last_user.get("content", "")
             if isinstance(content, list):
-                content = "\n".join(
+                # system-reminders always come first; the actual user message
+                # is the last text block in the list
+                text_blocks = [
                     b.get("text", "") for b in content
                     if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                # take the last non-empty block as the real user message
+                content = next(
+                    (t for t in reversed(text_blocks) if t.strip() and
+                    not any(t.startswith(p) for p in (
+                        "<system-reminder>", "[SUGGESTION MODE", "[Request interrupted",
+                        "The user stepped away", "[CONTEXT:"
+                    ))),
+                    ""
                 )
             if not content.strip():
                 continue
