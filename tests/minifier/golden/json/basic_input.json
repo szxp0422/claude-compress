@@ -1,0 +1,26 @@
+{
+  "name": "claude-compress",
+  "version": "1.0.0",
+  "description": "Token-optimized source code minifier",
+  "config": {
+    "max_tokens": 100000,
+    "enable_rename": true,
+    "supported_languages": ["python", "javascript", "typescript", "c", "cpp", "java"],
+    "thresholds": {
+      "min_reduction_pct": 10.0,
+      "max_identifier_len": 32
+    }
+  },
+  "dependencies": {
+    "tree-sitter": "0.26.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-javascript": "0.25.0"
+  },
+  "nested": {
+    "level1": {
+      "level2": {
+        "level3": [1, 2, 3, null, true, false]
+      }
+    }
+  }
+}

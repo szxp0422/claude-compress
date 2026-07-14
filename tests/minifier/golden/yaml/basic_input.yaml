@@ -1,0 +1,48 @@
+# Application configuration
+# This is the main config file
+
+name: claude-compress
+version: "1.0.0"
+
+# Language settings
+languages:
+  python:
+    group: B
+    rename: true
+    comment_types:
+      - comment
+
+  javascript:
+    group: A
+    rename: true
+
+  # Data formats
+  json:
+    group: A
+    rename: false
+
+  yaml:
+    group: B
+    rename: false
+
+# Performance thresholds
+thresholds:
+  min_reduction_percent: 10.0
+  max_identifier_length: 32
+  token_budget: 100000
+
+# Nested structure example
+database:
+  host: localhost
+  port: 5432
+  credentials:
+    username: admin
+    # password not stored here
+
+servers:
+  - name: primary
+    host: 10.0.0.1
+    enabled: true
+  - name: replica
+    host: 10.0.0.2
+    enabled: false
