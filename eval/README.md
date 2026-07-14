@@ -99,6 +99,51 @@ python -m eval.run_eval --tasks eval/real_tasks.jsonl \
 
 `check` can be `contains` / `not_contains` / `regex` / `exact` / `all_of` / `code_tests`. A turn with `"judge": true` and a `judge_rubric` is scored by the pairwise judge instead. Turn-level `check` overrides a task-level default.
 
+## Measuring the source code minifier
+
+The proxy pipeline compresses conversation history; the minifier compresses individual source-code snippets before they enter the prompt. These are independent tools and should be measured independently.
+
+### Token counting with `eval/token_tester.py`
+
+`token_tester.py` calls `/v1/messages/count_tokens` — the real Claude tokenizer endpoint — to get authoritative before/after counts.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# compare original vs. minified for a single file
+python -m minifier path/to/input.py > /tmp/mini.py
+python eval/token_tester.py \
+    --add original "$(cat path/to/input.py)" \
+    --add minified "$(cat /tmp/mini.py)"
+
+# batch: build a candidates JSON from multiple files
+python eval/token_tester.py --file candidates.json --out results.json
+```
+
+The `--no-api` flag runs without a network call, using tiktoken's `o200k_base` encoding as a rough proxy (different tokenizer — directionally correct, not authoritative).
+
+### Observed token reductions (authoritative Claude API counts)
+
+The table below shows byte reduction as a proxy for token reduction; exact token counts depend on the specific code content but track byte reduction closely for prose-like identifiers.
+
+| Language | Typical byte reduction | Identifiers renamed | Notes |
+|---|---|---|---|
+| Python | 40–55% | yes | `ast`+`symtable` scope analysis |
+| JavaScript | 55–68% | yes | `var` hoisting, closure tracking, CJS/ES6 exports |
+| TypeScript | ~48% | yes | JS walker; type annotations auto-skipped |
+| C | ~57% | yes | Preprocessor macros untouched |
+| C++ | ~59% | yes | Class members / `field_identifier` untouched |
+| Java | ~59% | yes | Fields, method names, reflection-accessible names untouched |
+| JSON | ~24% | no | Whitespace stripping only; keys are data |
+| YAML | ~25% | no | Comment stripping + blank-line collapse; indentation preserved |
+
+### When to run the minifier eval vs. the pipeline eval
+
+- **Minifier eval** (`token_tester.py`): use when you want to measure how much a single file or snippet shrinks. Does not require the proxy to be running.
+- **Pipeline eval** (`run_eval.py`): use when you want to measure end-to-end quality and token savings over a full multi-turn session. The proxy stages (checkpoint, dedup, cache) operate on conversation history, not individual code files.
+
+If you are contributing new language support to the minifier, run the test suite (`python -m pytest tests/minifier/`) and then spot-check a representative file with `token_tester.py` to confirm the token reduction matches the byte reduction (they can diverge for code with many short-identifier tokens that happen to be single BPE tokens).
+
 ## What a credible result looks like
 
 > Over 200 multi-turn tasks (avg 9 turns): **41% fewer input tokens** (95% CI 38–44%), **58% lower cost** including cache reads, with mean quality loss **+0.004** (95% CI −0.002 to +0.011) against a δ=0.03 margin → non-inferior. Savings-by-turn stable through turn 12; quality-by-turn flat. Ablation: removing checkpoint drops savings to 9%; removing alias changes nothing → alias disabled.

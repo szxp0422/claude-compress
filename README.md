@@ -82,6 +82,63 @@ $$n \geq \left(\frac{1.96 \times 0.5}{0.03 - (-0.2)}\right)^2 \approx 18$$
 
 Roughly 18 scored turns are needed to formally pass. The current dataset has 10, which is why the FAIL label appears despite compressed winning 5–7 of 10 judged turns in every configuration. The math and the direction of results are consistent — the gap is sample size only.
 
+## Source Code Minifier
+
+A standalone, lossless source code minifier targeting **Claude's tokenizer** rather than raw byte count. It strips comments and redundant whitespace and renames local identifiers to single-character names, all while preserving exact runtime behaviour.
+
+### Supported languages
+
+| Language | Group | Comment strip | Whitespace | Rename locals | Typical byte reduction |
+|---|---|---|---|---|---|
+| Python | B | ✓ | indent reduce | ✓ (`ast`+`symtable`) | 40–55% |
+| JavaScript | A | ✓ | reconstruct | ✓ (scope-aware) | 55–68% |
+| TypeScript | A | ✓ | reconstruct | ✓ (JS walker, type nodes skipped) | ~48% |
+| C | A | ✓ | reconstruct | ✓ (function-local only; macros untouched) | ~57% |
+| C++ | A | ✓ | reconstruct | ✓ (methods + free functions; members untouched) | ~59% |
+| Java | A | ✓ | reconstruct | ✓ (method-local only; fields/methods untouched) | ~59% |
+| JSON | A | — | reconstruct | — (keys are data, not identifiers) | ~24% |
+| YAML | B | ✓ | blank-line collapse | — (indentation is structural) | ~25% |
+
+**Group A** languages are delimiter-based: the minifier reconstructs the source from AST leaf tokens with minimum necessary spacing.  
+**Group B** languages are whitespace-significant: only comments and excess blank lines are removed; indentation is reduced in place (except YAML where it is structural and preserved as-is).
+
+### CLI
+
+```bash
+# auto-detects language from extension (.py, .js, .ts, .c, .cpp, .java, .json, .yaml / .yml)
+python -m minifier path/to/file.py
+
+# write to a file and save the old→new name map
+python -m minifier path/to/file.ts --out out.ts --map names.json
+
+# preserve readable names (whitespace only)
+python -m minifier path/to/file.java --no-rename
+```
+
+### Python API
+
+```python
+from minifier.minify import minify
+
+result = minify(source_code, lang="typescript")
+print(result.output)          # minified source
+print(result.name_map)        # {"longName": "a", "anotherName": "b", ...}
+print(result.stats.byte_reduction_pct)  # e.g. 48.4
+
+# supported lang keys: python, javascript/js, typescript/ts,
+#                      c, cpp/c++, java, json, yaml/yml
+```
+
+### Safety guarantees
+
+- **Lossless for code**: a minified Python/JS/TS/C/C++/Java file produces identical stdout to the original (verified by the test suite via subprocess round-trips with `gcc`, `g++`, `javac`, and `node`).
+- **Data-preserving for config**: minified JSON round-trips through `json.loads`; minified YAML round-trips through `pyyaml.safe_load`.
+- Local identifiers are renamed only when all occurrences are visible within the file. Exported names (ES6 `export`, CommonJS `module.exports`), class fields, method names, and macro bodies are never renamed.
+
+### Measuring token savings
+
+Use `eval/token_tester.py` to get exact Claude token counts (via the `/v1/messages/count_tokens` API) on original vs. minified snippets. See [`eval/README.md`](eval/README.md) for the full workflow.
+
 ## Requirements
 
 - Python 3.9+
