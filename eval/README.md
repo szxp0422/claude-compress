@@ -5,6 +5,8 @@ Token savings alone prove nothing. A layer that cuts tokens 80% while degrading 
 ## Current results (7 tasks, 44 turns, 10 judged turns — Sonnet 4.6 judge)
 
 > **Note:** FAILs on the non-inferiority test below are driven by wide confidence intervals from small sample size (10 scored turns), not by losses dominating. Compressed wins or ties on 7 of 10 judged turns in every configuration. ~50 scored turns are needed to tighten the CIs enough for a conclusive verdict.
+>
+> **Scope:** These results cover the text pipeline only (checkpoint, dedup, delta, eigencontext, alias). The `image_compress` stage was not active during this evaluation. See [Evaluating image compression](#evaluating-image-compression) below.
 
 ### Full pipeline (default config)
 - **input saved: 17.3%** (95% CI 7.9–27.3%)
@@ -33,6 +35,7 @@ Token savings alone prove nothing. A layer that cuts tokens 80% while degrading 
 - **Dedup** is the most neutral stage — modest savings, no quality impact
 - **Delta/cache** reduces cost without reducing size; Claude Code already manages its own cache breakpoints so this stage largely steps aside
 - Savings compound with turn count: t0–t8 near zero, t15+ consistently 65–80%
+- **Image compress** — not yet in these numbers; expected to dominate savings in computer-use sessions where visual tokens can exceed text tokens by 10–100×
 
 ---
 
@@ -58,6 +61,46 @@ The cache (delta) stage is **lossless on size** — Claude still sees every toke
 **Longitudinal replay is essential.** Compression is stateful — checkpoint summarisation and a growing cache prefix mean damage compounds. A single-turn test can look perfect while quality falls off a cliff at turn 40. The harness replays multi-turn tasks turn-by-turn, re-compressing each turn, and the report prints savings-by-turn so drift is visible. Add per-turn `check`s to get quality-by-turn too.
 
 **Ablation.** Turn each stage off one at a time (`--ablate`) to attribute both savings and quality cost. In the synthetic evaluation, checkpoint accounted for nearly all size reduction while the risky stages contributed almost nothing — ablation is how you discover that and cut dead weight.
+
+For image-heavy sessions, include `image_compress` in the ablation matrix. The dedup sub-feature (`image.dedup_exact`) is the dominant lever for computer-use workloads and should be isolated in its own ablation pass so its quality impact (expected: neutral) is measured separately from the resize pass (expected: mild risk on document/diagram content).
+
+## Evaluating image compression
+
+Image compression has no benchmark data yet. The expected profile — strong savings, near-zero quality impact for dedup, mild risk for resize on text-heavy images — needs verification on real computer-use sessions.
+
+### What to measure
+
+- **Visual token savings** — reported directly by the stage as `visual_tokens_saved` in `ccomp_metrics.jsonl`. This is distinct from text token savings and should be reported separately.
+- **Dedup hit rate** — `images_deduped / images_found`. A rate above 50% on computer-use sessions is typical; below 10% suggests few repeated screenshots and the dedup path adds negligible value.
+- **Classification accuracy** — spot-check a sample of images in `ccomp_metrics.jsonl` against the classifier's label (photo / document_text / diagram_ui). Misclassifying a screenshot as a photo risks applying seam carving; misclassifying a photo as document_text only means no seam carving (safe).
+- **Quality on visual tasks** — use objective checks where possible: OCR-style `contains` checks on text visible in screenshots, or task-completion checks when the agent acts on what it sees.
+
+### Task format for image-heavy sessions
+
+Add images to turns using the standard Messages API format. Base64-encoded images are rewritten by the stage; URL images are left untouched:
+
+```json
+{"id": "computer-use-task",
+ "turns": [
+   {"user": "Here is a screenshot of the error.", "images": [
+     {"type": "base64", "media_type": "image/png", "data": "<base64>"}
+   ]},
+   {"user": "What should I fix?",
+    "check": {"type": "contains", "value": "NullPointerException"}}
+ ]}
+```
+
+### Recommended ablation matrix for image sessions
+
+| Config | What it isolates |
+|---|---|
+| `image.enabled=false` | Baseline — no image compression |
+| `image.enabled=true, dedup_exact=true, max_tokens=9999` | Dedup only — measures quality impact of stubbing duplicates |
+| `image.enabled=true, dedup_exact=false, max_tokens=1024` | Resize only — measures quality impact of downscaling |
+| `image.enabled=true` (all defaults) | Full pipeline |
+| `image.enabled=true, old_age_threshold=16, old_age_max=256` | Age-based aggressive compression on old screenshots |
+
+---
 
 ## Measuring quality
 
@@ -146,6 +189,10 @@ If you are contributing new language support to the minifier, run the test suite
 
 ## What a credible result looks like
 
+**Text pipeline:**
 > Over 200 multi-turn tasks (avg 9 turns): **41% fewer input tokens** (95% CI 38–44%), **58% lower cost** including cache reads, with mean quality loss **+0.004** (95% CI −0.002 to +0.011) against a δ=0.03 margin → non-inferior. Savings-by-turn stable through turn 12; quality-by-turn flat. Ablation: removing checkpoint drops savings to 9%; removing alias changes nothing → alias disabled.
 
-That format — savings with bounded quality loss, longitudinally stable, attributed by ablation — is the structure of a credible claim. A bare "80% fewer tokens" is not.
+**Image pipeline (target format once data exists):**
+> Over 50 computer-use tasks (avg 12 turns, avg 8 images/turn): **image dedup** eliminated 63% of visual tokens with zero quality regressions (dedup hit rate 71%); **resize** reduced remaining image tokens by 58% with 2 quality regressions on diagram-heavy tasks where the classifier mislabelled screenshots as photos. Net: visual tokens −84%, text tokens −22%, total cost −61%. Ablation: disabling dedup halves visual savings; disabling resize has negligible quality impact → resize budget raised to 2048 for diagram-heavy workloads.
+
+That format — savings broken out by stage, dedup hit rate reported, quality attributed to specific failure modes — is the structure of a credible image compression claim.

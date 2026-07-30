@@ -22,6 +22,12 @@ def count_text(text: str) -> int:
     return len(_ENC.encode(text))
 
 
+def _count_image_block(block: dict) -> int:
+    """Visual token cost for a single image block (no Pillow needed for common formats)."""
+    from .image_utils import count_image_block_tokens
+    return count_image_block_tokens(block)
+
+
 def _block_text(block: Any) -> str:
     """Extract the text we can meaningfully count from a content block."""
     if isinstance(block, str):
@@ -51,7 +57,11 @@ def content_to_text(content: Any) -> str:
 
 
 def count_request(request: dict) -> int:
-    """Approximate total prompt tokens for a Messages API request body."""
+    """Approximate total prompt tokens for a Messages API request body.
+
+    Includes visual tokens for image content blocks (ceil(w/28)*ceil(h/28)
+    per block) so the tier selector and stage accounting reflect real cost.
+    """
     total = 0
     system = request.get("system")
     if isinstance(system, str):
@@ -59,7 +69,18 @@ def count_request(request: dict) -> int:
     elif isinstance(system, list):
         total += sum(count_text(b.get("text", "")) for b in system if isinstance(b, dict))
     for msg in request.get("messages", []):
-        total += count_text(content_to_text(msg.get("content", "")))
+        content = msg.get("content", "")
+        total += count_text(content_to_text(content))
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    total += _count_image_block(block)
+                elif isinstance(block, dict) and block.get("type") == "tool_result":
+                    inner = block.get("content")
+                    if isinstance(inner, list):
+                        for sub in inner:
+                            if isinstance(sub, dict) and sub.get("type") == "image":
+                                total += _count_image_block(sub)
     # tools schema contributes too
     tools = request.get("tools")
     if tools:

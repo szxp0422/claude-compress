@@ -7,3 +7,4 @@ tiktoken>=0.7.0
 
 # optional, strongly recommended for real semantic behaviour:
 #   pip install sentence-transformers   # real embeddings for dedup/eigencontext
+#   pip install Pillow                  # image compression stage (image_compress)

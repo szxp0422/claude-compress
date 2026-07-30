@@ -19,6 +19,31 @@ _logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ImageConfig:
+    # LOSSY (resizes images). Disabled by default — enable when images inflate
+    # context and full resolution isn't needed for the current task.
+    enabled: bool = False
+    # Compress any image that costs more than this many visual tokens.
+    # Claude formula: ceil(w/28) * ceil(h/28). A 1920x1080 image ≈ 2691 tokens.
+    max_tokens_per_image: int = 1024
+    # Never compress images in the last N messages (live working set).
+    protect_last_n_messages: int = 4
+    # Apply seam carving to PHOTOS still over budget after downscaling.
+    # Off by default: adds CPU cost and only safe for photographic content.
+    seam_carve_photos: bool = False
+    # Stub exact-duplicate images (same base64 data seen more than once in
+    # non-protected history). High value for computer-use sessions where the
+    # same screenshot recurs across many turns. Lossless after the first copy.
+    dedup_exact: bool = True
+    # Messages from the end of conversation beyond which an image is considered
+    # "old" and gets a stricter budget. 0 = disabled (flat budget everywhere).
+    old_age_threshold_messages: int = 0
+    # Token budget applied to images older than old_age_threshold_messages.
+    # Ignored when old_age_threshold_messages == 0.
+    old_age_max_tokens: int = 256
+
+
+@dataclass
 class DedupConfig:
     enabled: bool = True
     # cosine similarity above which two history blocks are considered dupes
@@ -119,6 +144,7 @@ class Config:
     alias: AliasConfig = field(default_factory=AliasConfig)
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
     tier: TierConfig = field(default_factory=TierConfig)
+    image: ImageConfig = field(default_factory=ImageConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -159,6 +185,8 @@ def load_config(path: Optional[str] = None) -> Config:
             cfg.state_machine = _coerce(StateMachineConfig, raw["state_machine"])
         if "tier" in raw:
             cfg.tier = _coerce(TierConfig, raw["tier"])
+        if "image" in raw:
+            cfg.image = _coerce(ImageConfig, raw["image"])
 
     # env overrides for the few operational knobs
     cfg.upstream_base_url = os.getenv("CCOMP_UPSTREAM", cfg.upstream_base_url)

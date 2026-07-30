@@ -29,6 +29,7 @@ from .stages.checkpoint import CheckpointStage, SummarizeFn
 from .stages.dedup import DedupStage
 from .stages.delta import DeltaStage
 from .stages.eigencontext import EigencontextStage
+from .stages.image_compress import ImageCompressStage
 from .stages.state_machine import StateMachineStage
 from .tokens import count_request
 
@@ -37,6 +38,7 @@ class Pipeline:
     def __init__(self, cfg: Config, summarize_fn: Optional[SummarizeFn] = None):
         self.cfg = cfg
         self.stages = [
+            ImageCompressStage(cfg.image),  # first: reduces image tokens before text stages
             StateMachineStage(cfg.state_machine),
             CheckpointStage(cfg.checkpoint, summarize_fn=summarize_fn),
             DedupStage(cfg.dedup),
@@ -62,8 +64,14 @@ class Pipeline:
 
         if tool_ratio > 0.30:
             # tool-heavy: skip alias and eigencontext — they don't understand
-            # tool_result structure and add overhead without benefit
-            safe_for_tools = {"semantic_dedup", "checkpoint_compression", "delta_cache_breakpoints"}
+            # tool_result structure and add overhead without benefit.
+            # image_compress is safe here: screenshots in tool_result are common.
+            safe_for_tools = {
+                "image_compress",
+                "semantic_dedup",
+                "checkpoint_compression",
+                "delta_cache_breakpoints",
+            }
             return [s for s in self.stages if s.name in safe_for_tools and s.enabled()]
 
         # normal prose/code session: run all enabled stages

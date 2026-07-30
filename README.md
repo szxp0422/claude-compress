@@ -28,6 +28,7 @@ The Messages API is stateless, so middleware cannot hide context from Claude. Ea
 | `delta_cache_breakpoints` | **on** | no | Inserts `cache_control` breakpoints on the stable prefix (system, tools, old turns). Cuts **cost** (cached input is billed at a discount), not prompt size. Steps aside if the client already manages its own cache breakpoints. |
 | `semantic_dedup` | **on** | safe | Drops history text blocks whose meaning duplicates an earlier block. Threshold is computed per-session via Otsu's method (finds the natural valley in the pairwise similarity distribution) and pulled down further under token pressure. Never touches the last N messages or tool/image blocks. |
 | `checkpoint_compression` | **on** | safe | Once a conversation passes a token threshold, folds the oldest turns into one compact summary via a cheap Haiku side-call. Highest-value stage for long sessions — accounts for roughly half of total size reduction. |
+| `image_compress` | off | **lossy** | Reduces the visual-token cost of image blocks in conversation history. Works in three passes: (1) **exact dedup** — replaces repeated screenshots with a 1×1 stub (saves 100% of duplicate tokens, especially valuable in computer-use sessions); (2) **age-based budget** — applies a stricter token limit to very old images; (3) **resize** — classifies each image as photo / document_text / diagram_ui via cheap numpy heuristics, crops whitespace margins, and downscales to a per-image token budget. Seam carving for photos is available but off by default. Requires Pillow. Token counting covers PNG, JPEG, GIF, and WebP (VP8X). |
 | `eigencontext` | off | **lossy** | Greedy max-coverage sentence selection over `<<REF>>`-tagged reference blocks only. Disabled by default: dropping context from a coding agent is risky. |
 | `alias_substitution` | off | **risky** | Replaces long repeated strings with short aliases and a legend; expands them back in the response. Only profitable when a string repeats 8+ times; marginal wins on most sessions. |
 | `state_machine` | off | n/a | If the client passes a `metadata._fsm` spec, injects a compact transition table instead of prose workflow text. |
@@ -144,6 +145,7 @@ Use `eval/token_tester.py` to get exact Claude token counts (via the `/v1/messag
 - Python 3.9+
 - `fastapi`, `uvicorn`, `httpx`, `numpy`, `tiktoken` (all in `requirements.txt`)
 - `sentence-transformers` — optional but strongly recommended for real semantic deduplication and eigencontext. Without it, embeddings fall back to a deterministic lexical-hash vector (catches near-duplicates but not deep semantic similarity).
+- `Pillow` — optional, required for the `image_compress` stage. Without it that stage self-disables gracefully.
 
 ## Install
 
@@ -152,6 +154,9 @@ pip install -r requirements.txt
 
 # optional but recommended for real semantic behaviour:
 pip install sentence-transformers
+
+# optional, required for image compression:
+pip install Pillow
 ```
 
 ## Run
@@ -205,6 +210,13 @@ Key knobs:
 | `checkpoint.keep_recent_messages` | `8` | Verbatim turns always preserved |
 | `checkpoint.min_compression_ratio` | `2.0` | ROI gate: skip if summary isn't 2× smaller |
 | `dedup.threshold` | `0.93` | Fallback similarity floor used only when fewer than 3 blocks exist; otherwise Otsu's method picks the threshold automatically |
+| `image.enabled` | `false` | Enable image compression (requires Pillow) |
+| `image.max_tokens_per_image` | `1024` | Compress images that exceed this visual-token count. A 1920×1080 image costs ~2691 tokens; 1024 ≈ 896×896. |
+| `image.protect_last_n_messages` | `4` | Leave images in the most recent N messages at full resolution |
+| `image.seam_carve_photos` | `false` | Apply seam carving after downscaling for photos still over budget (CPU-intensive; only safe for photographic content) |
+| `image.dedup_exact` | `true` | Replace exact-duplicate images beyond their first occurrence with a 1×1 stub. Saves 100% of tokens for repeated screenshots. |
+| `image.old_age_threshold_messages` | `0` | Apply a stricter budget to images older than this many messages from the end. `0` disables age-based compression. |
+| `image.old_age_max_tokens` | `256` | Token budget used for images beyond `old_age_threshold_messages`. Ignored when threshold is 0. |
 
 Environment overrides: `CCOMP_UPSTREAM`, `CCOMP_HOST`, `CCOMP_PORT`, `CCOMP_METRICS`, `CCOMP_LOG_LEVEL`.
 
@@ -224,16 +236,25 @@ Ground-truth usage from the API (real token counts, cache hits, cost) is logged 
 ## Tests
 
 ```bash
-python test_pipeline.py      # offline: savings + safety invariants (no network)
-python test_integration.py   # proxy against a mock upstream (no real API key needed)
+# Unit + stage tests (no network, no API key)
+python -m pytest tests/
+
+# Offline smoke test: savings + safety invariants across all stages
+python test_pipeline.py
+
+# End-to-end proxy test against a mock upstream (no real API key needed)
+python test_integration.py
 ```
 
 `test_pipeline.py` asserts the invariants that matter: the live (most recent) user turn is never altered, tool schemas stay intact, user/assistant role alternation is preserved, and aliases only fire when they are token-profitable.
 
+`tests/test_image_compress.py` covers image token counting (PNG/JPEG/GIF/WebP header parsing), the stub PNG constant, exact-duplicate deduplication, age-based budget selection, whitespace cropping, downscaling, classification heuristics, and seam carving. Tests that require Pillow are automatically skipped when it is not installed.
+
 ## Safety model
 
 - The most recent `protect_last_n_messages` turns are never compressed by any stage.
-- `tool_use`, `tool_result`, and `image` blocks are never modified.
+- `tool_use` blocks are never modified by text stages.
+- Only base64 images are rewritten by `image_compress`; URL images are left untouched.
 - Any stage that throws is skipped, not fatal — a broken stage cannot corrupt a request.
 - Checkpoint compression preserves role alternation when injecting its summary message.
 - The alias stage computes net token savings before committing; it skips if the legend overhead exceeds the substitution savings.
@@ -243,8 +264,15 @@ python test_integration.py   # proxy against a mock upstream (no real API key ne
 
 Start with defaults. For more aggressive savings on long sessions, lower `checkpoint.trigger_tokens` and `checkpoint.keep_recent_messages`. Enable `eigencontext` or `alias_substitution` only after measuring that they do not degrade output quality on your workload — use the eval harness in `eval/` and watch the per-stage savings in `ccomp_metrics.jsonl`.
 
+For **image-heavy or computer-use sessions**, enable `image.enabled` and set `image.max_tokens_per_image` to match your task's visual detail requirements (lower = more aggressive). `image.dedup_exact` is on by default and is the highest-value lever when the same screenshot recurs across turns. If images are still expensive after many turns, set `image.old_age_threshold_messages` to a turn count (e.g. `16`) and reduce `image.old_age_max_tokens` to push very old screenshots to near-thumbnail size.
+
 ## Contributing
 
 The project needs more eval data. If you use Claude Code regularly, running the proxy with `CCOMP_RECORD=sessions.jsonl` and contributing your anonymised task files helps tighten the confidence intervals. See [`eval/README.md`](eval/README.md) for the task format and how to add judge rubrics.
 
-The theoretical case for compression is sound; the empirical gap is purely sample size. Contributions of real multi-turn sessions, additional judge rubrics, or objective `check` conditions for coding tasks are the highest-value additions.
+The theoretical case for compression is sound; the empirical gap is purely sample size. The highest-value contributions are:
+
+- **Real multi-turn sessions** recorded via `CCOMP_RECORD` — any length, any task type
+- **Image-heavy or computer-use sessions** — the image_compress stage has no benchmark data yet; sessions with repeated screenshots are especially useful
+- **Objective `check` conditions** for coding tasks (test-suite pass/fail beats LLM-as-judge for code quality)
+- **Additional judge rubrics** for open-ended or agentic tasks
