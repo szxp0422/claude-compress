@@ -137,6 +137,58 @@ def iter_all_text(
     return out
 
 
+def iter_tool_result_blocks(
+    request: dict, protect_last_n: int = 0
+) -> List[Tuple[int, int, dict]]:
+    """Yield (message_index, block_index, block) for every tool_result block
+    that is eligible for transformation (skips the last protect_last_n messages).
+    """
+    msgs = request.get("messages", [])
+    cutoff = len(msgs) - protect_last_n
+    out: List[Tuple[int, int, dict]] = []
+    for mi, msg in enumerate(msgs):
+        if mi >= cutoff:
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for bi, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                out.append((mi, bi, block))
+    return out
+
+
+def get_tool_result_text(block: dict) -> str:
+    """Return the plain-text content of a tool_result block (handles both
+    string and list-of-blocks content formats)."""
+    return extract_tool_result_text(block)
+
+
+def set_tool_result_text(block: dict, new_text: str) -> None:
+    """Overwrite the text content of a tool_result block in place.
+
+    Handles both the bare-string content format and the list-of-blocks format.
+    When the content is a list, the first text sub-block is updated and any
+    additional text sub-blocks are cleared (they are artefacts of formatting).
+    """
+    content = block.get("content", "")
+    if isinstance(content, str):
+        block["content"] = new_text
+        return
+    if isinstance(content, list):
+        first = True
+        for sub in content:
+            if isinstance(sub, dict) and sub.get("type") == "text":
+                if first:
+                    sub["text"] = new_text
+                    first = False
+                else:
+                    sub["text"] = ""
+        if first:
+            # No text sub-block found — append one.
+            content.append({"type": "text", "text": new_text})
+
+
 def count_tool_result_tokens(request: dict) -> int:
     """Count tokens that live inside tool_result blocks.
 

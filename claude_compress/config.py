@@ -19,6 +19,46 @@ _logger = logging.getLogger(__name__)
 
 
 @dataclass
+class JsonConfig:
+    # Minify + truncate JSON in tool_result blocks. Enabled by default: minification
+    # is lossless and truncation only fires when arrays/strings exceed the limits below.
+    enabled: bool = True
+    # Only process blocks whose token count meets this minimum (avoid overhead on tiny results).
+    min_compress_tokens: int = 80
+    # Maximum array items to keep; longer arrays are reduced to head + tail.
+    max_array_items: int = 20
+    # Maximum characters for any individual string value; longer strings are truncated.
+    max_string_chars: int = 500
+    # Never modify tool_result blocks in the last N messages (live working set).
+    protect_last_n_messages: int = 4
+
+
+@dataclass
+class LogConfig:
+    # Collapse repeated lines and truncate long stack traces in tool_result blocks.
+    # Enabled by default: both operations are safe and self-gating.
+    enabled: bool = True
+    # Only process blocks whose token count meets this minimum.
+    min_compress_tokens: int = 80
+    # Maximum stack frames to keep in a single trace (head + tail).
+    max_stack_frames: int = 20
+    # Never modify tool_result blocks in the last N messages.
+    protect_last_n_messages: int = 4
+
+
+@dataclass
+class HtmlConfig:
+    # Strip scripts/styles/nav and convert HTML to text in tool_result blocks.
+    # Disabled by default: enable for web-scraping workloads. Disable if the HTML
+    # structure itself is the subject of the conversation.
+    enabled: bool = False
+    # Only process blocks whose token count meets this minimum.
+    min_compress_tokens: int = 200
+    # Never modify tool_result blocks in the last N messages.
+    protect_last_n_messages: int = 4
+
+
+@dataclass
 class ImageConfig:
     # LOSSY (resizes images). Disabled by default — enable when images inflate
     # context and full resolution isn't needed for the current task.
@@ -145,6 +185,9 @@ class Config:
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
     tier: TierConfig = field(default_factory=TierConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
+    json: JsonConfig = field(default_factory=JsonConfig)
+    log: LogConfig = field(default_factory=LogConfig)
+    html: HtmlConfig = field(default_factory=HtmlConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -187,6 +230,12 @@ def load_config(path: Optional[str] = None) -> Config:
             cfg.tier = _coerce(TierConfig, raw["tier"])
         if "image" in raw:
             cfg.image = _coerce(ImageConfig, raw["image"])
+        if "json" in raw:
+            cfg.json = _coerce(JsonConfig, raw["json"])
+        if "log" in raw:
+            cfg.log = _coerce(LogConfig, raw["log"])
+        if "html" in raw:
+            cfg.html = _coerce(HtmlConfig, raw["html"])
 
     # env overrides for the few operational knobs
     cfg.upstream_base_url = os.getenv("CCOMP_UPSTREAM", cfg.upstream_base_url)

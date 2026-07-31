@@ -6,7 +6,7 @@ Token savings alone prove nothing. A layer that cuts tokens 80% while degrading 
 
 > **Note:** FAILs on the non-inferiority test below are driven by wide confidence intervals from small sample size (10 scored turns), not by losses dominating. Compressed wins or ties on 7 of 10 judged turns in every configuration. ~50 scored turns are needed to tighten the CIs enough for a conclusive verdict.
 >
-> **Scope:** These results cover the text pipeline only (checkpoint, dedup, delta, eigencontext, alias). The `image_compress` stage was not active during this evaluation. See [Evaluating image compression](#evaluating-image-compression) below.
+> **Scope:** These results cover the text pipeline only (checkpoint, dedup, delta, eigencontext, alias). The `image_compress`, `json_compress`, `log_compress`, and `html_compress` stages were not active during this evaluation. See [Evaluating image compression](#evaluating-image-compression) and [Evaluating format compression](#evaluating-format-compression) below.
 
 ### Full pipeline (default config)
 - **input saved: 17.3%** (95% CI 7.9–27.3%)
@@ -36,6 +36,46 @@ Token savings alone prove nothing. A layer that cuts tokens 80% while degrading 
 - **Delta/cache** reduces cost without reducing size; Claude Code already manages its own cache breakpoints so this stage largely steps aside
 - Savings compound with turn count: t0–t8 near zero, t15+ consistently 65–80%
 - **Image compress** — not yet in these numbers; expected to dominate savings in computer-use sessions where visual tokens can exceed text tokens by 10–100×
+- **Format compress (json/log/html)** — not yet in these numbers; expected to show moderate savings in agentic sessions with large tool_result payloads and zero quality cost (operations are self-gating and structure-preserving)
+
+---
+
+## Evaluating format compression
+
+The `json_compress`, `log_compress`, and `html_compress` stages target `tool_result` blocks. They have no benchmark data yet. The expected profile — moderate savings, no quality cost — needs verification on agentic sessions where tools return large JSON payloads, shell output, or web pages.
+
+### What to measure
+
+- **Blocks compressed per stage** — reported as `blocks_compressed` in `ccomp_metrics.jsonl`. A rate near zero means the guard conditions (content type, minimum token threshold) are rarely triggered; raise `min_compress_tokens` or reconsider whether the stage is relevant for your workload.
+- **Token savings per stage** — reported as `tokens_saved` in `ccomp_metrics.jsonl`. Compare to total `tokens_in` to understand each stage's contribution.
+- **JSON fidelity** — spot-check compressed tool_results: the truncated form should parse as valid JSON, the omission marker (`[…N items omitted…]`) should be present, and key fields referenced in later turns should be in the head or tail.
+- **Log/trace completeness** — the error type and message lines should survive truncation; only interior frame repetitions are removed.
+- **HTML content accuracy** — after extraction, key facts visible on the page (headlines, key data) should still be present; navigation links and cookie banners should be absent.
+
+### Task format for agentic sessions with tool results
+
+Add `tool_result` turns directly in the task JSONL. Use `check` conditions to verify that compressed tool outputs still support correct downstream reasoning:
+
+```json
+{"id": "json-api-task",
+ "turns": [
+   {"user": "Search for the latest 50 results.",
+    "tool_results": [{"id": "call_1", "content": "[{\"id\": 1, ...}, ...]"}]},
+   {"user": "What was the highest-scoring result?",
+    "check": {"type": "contains", "value": "id"}}
+ ]}
+```
+
+### Recommended ablation matrix for tool-heavy sessions
+
+| Config | What it isolates |
+|---|---|
+| `json.enabled=false, log.enabled=false, html.enabled=false` | Baseline — no format compression |
+| `json.enabled=true` only | JSON savings alone |
+| `log.enabled=true` only | Log/trace savings alone |
+| `html.enabled=true` only | HTML extraction savings alone |
+| All three enabled (defaults for json/log; html opt-in) | Full format pipeline |
+| `json.max_array_items=5, json.max_string_chars=100` | Aggressive JSON truncation — higher savings, check for fidelity regressions |
 
 ---
 
@@ -195,4 +235,7 @@ If you are contributing new language support to the minifier, run the test suite
 **Image pipeline (target format once data exists):**
 > Over 50 computer-use tasks (avg 12 turns, avg 8 images/turn): **image dedup** eliminated 63% of visual tokens with zero quality regressions (dedup hit rate 71%); **resize** reduced remaining image tokens by 58% with 2 quality regressions on diagram-heavy tasks where the classifier mislabelled screenshots as photos. Net: visual tokens −84%, text tokens −22%, total cost −61%. Ablation: disabling dedup halves visual savings; disabling resize has negligible quality impact → resize budget raised to 2048 for diagram-heavy workloads.
 
-That format — savings broken out by stage, dedup hit rate reported, quality attributed to specific failure modes — is the structure of a credible image compression claim.
+**Format pipeline (target format once data exists):**
+> Over 100 agentic tasks with tool_result blocks (avg 6 turns, avg 3 tool calls/turn): **json_compress** reduced JSON payload tokens by 34% (blocks_compressed rate 61%, no quality regressions — truncated fields never referenced downstream); **log_compress** reduced log/trace tokens by 58% (repeated-line collapse accounted for 40%, frame truncation 60%); **html_compress** (enabled on web-scraping subset, 30 tasks) reduced HTML tokens by 71% with 1 regression where a navigation link was load-bearing. Net: tool_result tokens −44%, total tokens −18%, total cost −22% (additive with text pipeline). Ablation: disabling json_compress alone drops savings to −12%; disabling log_compress drops to −8%; html step-aside for non-HTML content is zero-cost.
+
+That format — savings broken out by stage, block compression rate reported, quality attributed to specific failure modes — is the structure of a credible format compression claim.

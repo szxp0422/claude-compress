@@ -1,12 +1,16 @@
 """Pipeline: run the input stages in a safe, fixed order.
 
 Order matters:
-  1. state_machine   -- inject compact workflow (adds a few tokens, opt-in)
-  2. checkpoint      -- fold old turns FIRST so later stages work on less text
-  3. dedup           -- remove near-duplicate survivors
-  4. eigencontext    -- prune tagged reference material (lossy, opt-in)
-  5. alias           -- substitute repeated long strings (risky, opt-in)
-  6. delta           -- LAST: insert cache breakpoints on the final shape
+  1. image_compress  -- reduce image visual tokens (opt-in; Pillow required)
+  2. json_compress   -- minify + truncate JSON in tool_results (on by default)
+  3. log_compress    -- collapse repeated lines + truncate stack traces (on by default)
+  4. html_compress   -- strip HTML boilerplate, extract text (opt-in)
+  5. state_machine   -- inject compact workflow (adds a few tokens, opt-in)
+  6. checkpoint      -- fold old turns so later stages work on less text
+  7. dedup           -- remove near-duplicate survivors
+  8. eigencontext    -- prune tagged reference material (lossy, opt-in)
+  9. alias           -- substitute repeated long strings (risky, opt-in)
+  10. delta          -- LAST: insert cache breakpoints on the final shape
                         (must run last so breakpoints sit on stable content)
 
 Dynamic tiering:
@@ -29,7 +33,10 @@ from .stages.checkpoint import CheckpointStage, SummarizeFn
 from .stages.dedup import DedupStage
 from .stages.delta import DeltaStage
 from .stages.eigencontext import EigencontextStage
+from .stages.html_compress import HtmlCompressStage
 from .stages.image_compress import ImageCompressStage
+from .stages.json_compress import JsonCompressStage
+from .stages.log_compress import LogCompressStage
 from .stages.state_machine import StateMachineStage
 from .tokens import count_request
 
@@ -38,7 +45,12 @@ class Pipeline:
     def __init__(self, cfg: Config, summarize_fn: Optional[SummarizeFn] = None):
         self.cfg = cfg
         self.stages = [
-            ImageCompressStage(cfg.image),  # first: reduces image tokens before text stages
+            # Format-specific stages run first so checkpoint and dedup see
+            # already-compressed tool results.
+            ImageCompressStage(cfg.image),
+            JsonCompressStage(cfg.json),
+            LogCompressStage(cfg.log),
+            HtmlCompressStage(cfg.html),
             StateMachineStage(cfg.state_machine),
             CheckpointStage(cfg.checkpoint, summarize_fn=summarize_fn),
             DedupStage(cfg.dedup),
@@ -65,9 +77,12 @@ class Pipeline:
         if tool_ratio > 0.30:
             # tool-heavy: skip alias and eigencontext — they don't understand
             # tool_result structure and add overhead without benefit.
-            # image_compress is safe here: screenshots in tool_result are common.
+            # Format stages (image, json, log, html) are especially valuable here.
             safe_for_tools = {
                 "image_compress",
+                "json_compress",
+                "log_compress",
+                "html_compress",
                 "semantic_dedup",
                 "checkpoint_compression",
                 "delta_cache_breakpoints",

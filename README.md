@@ -28,6 +28,9 @@ The Messages API is stateless, so middleware cannot hide context from Claude. Ea
 | `delta_cache_breakpoints` | **on** | no | Inserts `cache_control` breakpoints on the stable prefix (system, tools, old turns). Cuts **cost** (cached input is billed at a discount), not prompt size. Steps aside if the client already manages its own cache breakpoints. |
 | `semantic_dedup` | **on** | safe | Drops history text blocks whose meaning duplicates an earlier block. Threshold is computed per-session via Otsu's method (finds the natural valley in the pairwise similarity distribution) and pulled down further under token pressure. Never touches the last N messages or tool/image blocks. |
 | `checkpoint_compression` | **on** | safe | Once a conversation passes a token threshold, folds the oldest turns into one compact summary via a cheap Haiku side-call. Highest-value stage for long sessions — accounts for roughly half of total size reduction. |
+| `json_compress` | **on** | safe | Minifies and truncates JSON in `tool_result` blocks. Minification (removing whitespace) is lossless. Truncation reduces arrays longer than `max_array_items` to a head + tail with a count annotation, and caps long string values at `max_string_chars`. Skips blocks below `min_compress_tokens` and protects the most recent `protect_last_n_messages` turns. High-value for agentic sessions that call JSON APIs or search tools. |
+| `log_compress` | **on** | safe | Compresses shell output, log streams, and exception traces in `tool_result` blocks. Two passes: (1) collapses consecutive identical lines to `[above line repeated ×N]`; (2) truncates long stack-frame runs to head + tail with a `[N frames omitted]` gap. Both passes are self-gating — no-op on non-log content. Detects Python, Java/Kotlin, Node.js/V8, GDB/LLDB, and macOS crash frames. |
+| `html_compress` | off | safe | Strips HTML boilerplate from `tool_result` blocks and converts semantic content to markdown-adjacent text using stdlib `html.parser`. Drops `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>`, `<aside>`, `<form>`, and other non-content tags. Converts headings to `# …` markdown, preserves `<pre>` blocks as code fences, converts lists to `- item` lines. Disabled by default: enable for web-scraping workloads; leave off if the HTML structure itself is the subject of the session. |
 | `image_compress` | off | **lossy** | Reduces the visual-token cost of image blocks in conversation history. Works in three passes: (1) **exact dedup** — replaces repeated screenshots with a 1×1 stub (saves 100% of duplicate tokens, especially valuable in computer-use sessions); (2) **age-based budget** — applies a stricter token limit to very old images; (3) **resize** — classifies each image as photo / document_text / diagram_ui via cheap numpy heuristics, crops whitespace margins, and downscales to a per-image token budget. Seam carving for photos is available but off by default. Requires Pillow. Token counting covers PNG, JPEG, GIF, and WebP (VP8X). |
 | `eigencontext` | off | **lossy** | Greedy max-coverage sentence selection over `<<REF>>`-tagged reference blocks only. Disabled by default: dropping context from a coding agent is risky. |
 | `alias_substitution` | off | **risky** | Replaces long repeated strings with short aliases and a legend; expands them back in the response. Only profitable when a string repeats 8+ times; marginal wins on most sessions. |
@@ -210,6 +213,18 @@ Key knobs:
 | `checkpoint.keep_recent_messages` | `8` | Verbatim turns always preserved |
 | `checkpoint.min_compression_ratio` | `2.0` | ROI gate: skip if summary isn't 2× smaller |
 | `dedup.threshold` | `0.93` | Fallback similarity floor used only when fewer than 3 blocks exist; otherwise Otsu's method picks the threshold automatically |
+| `json.enabled` | `true` | Enable JSON minification + truncation in tool_result blocks |
+| `json.min_compress_tokens` | `80` | Skip blocks below this token count |
+| `json.max_array_items` | `20` | Maximum array elements before head+tail truncation |
+| `json.max_string_chars` | `500` | Maximum string length before truncation |
+| `json.protect_last_n_messages` | `4` | Leave tool_results in the most recent N messages untouched |
+| `log.enabled` | `true` | Enable log/stack-trace compression in tool_result blocks |
+| `log.min_compress_tokens` | `80` | Skip blocks below this token count |
+| `log.max_stack_frames` | `20` | Maximum stack frames to keep in a single trace (head + tail) |
+| `log.protect_last_n_messages` | `4` | Leave tool_results in the most recent N messages untouched |
+| `html.enabled` | `false` | Enable HTML-to-text extraction in tool_result blocks (for web-scraping workloads) |
+| `html.min_compress_tokens` | `200` | Skip blocks below this token count |
+| `html.protect_last_n_messages` | `4` | Leave tool_results in the most recent N messages untouched |
 | `image.enabled` | `false` | Enable image compression (requires Pillow) |
 | `image.max_tokens_per_image` | `1024` | Compress images that exceed this visual-token count. A 1920×1080 image costs ~2691 tokens; 1024 ≈ 896×896. |
 | `image.protect_last_n_messages` | `4` | Leave images in the most recent N messages at full resolution |
@@ -250,6 +265,8 @@ python test_integration.py
 
 `tests/test_image_compress.py` covers image token counting (PNG/JPEG/GIF/WebP header parsing), the stub PNG constant, exact-duplicate deduplication, age-based budget selection, whitespace cropping, downscaling, classification heuristics, and seam carving. Tests that require Pillow are automatically skipped when it is not installed.
 
+`tests/test_format_compress.py` covers the JSON, log, and HTML compression utilities and their corresponding stages: minification and array/string truncation, stack-frame pattern detection across Python/Java/Node.js/GDB/macOS trace formats, repeated-line collapse, HTML tag stripping and markdown conversion, the `protect_last_n_messages` boundary, and the `enabled()` flag (HTML disabled by default).
+
 ## Safety model
 
 - The most recent `protect_last_n_messages` turns are never compressed by any stage.
@@ -263,6 +280,8 @@ python test_integration.py
 ## Tuning
 
 Start with defaults. For more aggressive savings on long sessions, lower `checkpoint.trigger_tokens` and `checkpoint.keep_recent_messages`. Enable `eigencontext` or `alias_substitution` only after measuring that they do not degrade output quality on your workload — use the eval harness in `eval/` and watch the per-stage savings in `ccomp_metrics.jsonl`.
+
+For **tool-heavy or agentic sessions** (web search, API calls, shell commands), the `json_compress` and `log_compress` stages are on by default and require no tuning. If your agent returns very large JSON payloads, lower `json.max_array_items` or `json.max_string_chars`. If your agent produces dense log streams with many repeated lines or very deep stack traces, lower `log.max_stack_frames`. Enable `html_compress` for sessions where tools return raw web pages — it typically cuts HTML tool_result size by 60–80%.
 
 For **image-heavy or computer-use sessions**, enable `image.enabled` and set `image.max_tokens_per_image` to match your task's visual detail requirements (lower = more aggressive). `image.dedup_exact` is on by default and is the highest-value lever when the same screenshot recurs across turns. If images are still expensive after many turns, set `image.old_age_threshold_messages` to a turn count (e.g. `16`) and reduce `image.old_age_max_tokens` to push very old screenshots to near-thumbnail size.
 
