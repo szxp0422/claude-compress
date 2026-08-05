@@ -82,6 +82,16 @@ class ImageConfig:
     # Ignored when old_age_threshold_messages == 0.
     old_age_max_tokens: int = 256
 
+    # OCR extraction for document_text images — replaces image block with text block.
+    # Much cheaper than visual tokens for terminal output, code, stack traces.
+    # Requires pytesseract (default) or easyocr — see image_utils.py for install.
+    # Falls back to downscaling if OCR fails or returns too little text.
+    ocr_enabled: bool = False
+    # 'tesseract' (fast, local) or 'easyocr' (slower, more accurate)
+    ocr_backend: str = "tesseract"
+    # minimum character count for OCR output to be accepted (filters noise)
+    ocr_min_chars: int = 30
+
 
 @dataclass
 class DedupConfig:

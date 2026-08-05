@@ -8,3 +8,9 @@ tiktoken>=0.7.0
 # optional, strongly recommended for real semantic behaviour:
 #   pip install sentence-transformers   # real embeddings for dedup/eigencontext
 #   pip install Pillow                  # image compression stage (image_compress)
+
+# optional: OCR extraction for document_text images (terminal screenshots, logs)
+#   pip install pytesseract             # fast; also needs the Tesseract binary:
+#                                       #   brew install tesseract  (macOS)
+#                                       #   apt install tesseract-ocr  (Linux)
+#   pip install easyocr                 # slower, better accuracy, no binary dep

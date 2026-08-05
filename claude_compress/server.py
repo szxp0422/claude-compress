@@ -17,6 +17,8 @@ import asyncio
 import os
 import json
 import logging
+import threading
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -31,11 +33,32 @@ from .postprocess.responses import (
     expand_sse_event,
     record_assistant_turn,
 )
+from .session_store import SessionStore as SQLiteSessionStore
 from .state import StateStore
 from .usage import StreamingUsageAccumulator, parse_usage
 
 logger = logging.getLogger("ccomp")
 _RECORD_DIR = os.getenv("CCOMP_RECORD_DIR") or os.getenv("CCOMP_RECORD")
+
+# module-level SQLite store reference set by create_app
+_sqlite_session_store: "SQLiteSessionStore | None" = None
+# in-memory accumulator: session_id -> list of rows (flushed incrementally)
+_session_row_buffer: "dict[str, list]" = {}
+_session_buffer_lock = threading.Lock()
+
+
+def _load_context_prefix() -> str:
+    """Load context.md if it exists and return it as a system prompt prefix."""
+    context_path = Path.home() / ".claude-compress" / "context.md"
+    if context_path.exists():
+        text = context_path.read_text().strip()
+        if not text:
+            return ""
+        # strip the HTML comment header line
+        lines = text.splitlines()
+        content_lines = [l for l in lines if not l.startswith("<!--")]
+        return "\n".join(content_lines).strip()
+    return ""
 
 # headers we must forward upstream; hop-by-hop and host are dropped
 _FORWARD_HEADERS = {
@@ -89,6 +112,7 @@ def make_summarizer(cfg: Config, headers: dict):
 
 
 def create_app(cfg: Optional[Config] = None) -> FastAPI:
+    global _sqlite_session_store
     cfg = cfg or load_config()
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO))
     app = FastAPI(title="claude-compress proxy")
@@ -99,6 +123,13 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     )
     metrics = Metrics(cfg.metrics_path)
     app.state.cfg = cfg
+
+    # SQLite session index — bounds disk usage, enables local dream command
+    _sqlite_store = SQLiteSessionStore()
+    _retention_stats = _sqlite_store.apply_retention()
+    if any(v > 0 for v in _retention_stats.values()):
+        logger.info("session retention: %s", _retention_stats)
+    _sqlite_session_store = _sqlite_store
 
     @app.get("/healthz")
     async def healthz():
@@ -116,6 +147,19 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 
         headers = _auth_headers(request)
         streaming = bool(req_body.get("stream"))
+
+        # inject past-session context prefix into system prompt if available
+        context_prefix = _load_context_prefix()
+        if context_prefix:
+            system = req_body.get("system")
+            if isinstance(system, str):
+                req_body["system"] = context_prefix + "\n\n" + system
+            elif isinstance(system, list):
+                req_body["system"] = [
+                    {"type": "text", "text": context_prefix}
+                ] + system
+            elif system is None:
+                req_body["system"] = context_prefix
 
         # --- input pipeline ------------------------------------------------
         state = store.get(req_body)
@@ -218,7 +262,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     return app
 
 def _record(session_id: str, req_body: dict, resp_body: dict):
-    if not _RECORD_DIR:
+    if not _RECORD_DIR and _sqlite_session_store is None:
         return
     import time
     row = {
@@ -227,13 +271,25 @@ def _record(session_id: str, req_body: dict, resp_body: dict):
         "request": req_body,
         "response": resp_body,
     }
-    try:
-        os.makedirs(_RECORD_DIR, exist_ok=True)
-        path = os.path.join(_RECORD_DIR, f"{session_id}.jsonl")
-        with open(path, "a") as f:
-            f.write(json.dumps(row) + "\n")
-    except Exception:
-        pass
+    # write to flat file directory if CCOMP_RECORD / CCOMP_RECORD_DIR is set
+    if _RECORD_DIR:
+        try:
+            os.makedirs(_RECORD_DIR, exist_ok=True)
+            path = os.path.join(_RECORD_DIR, f"{session_id}.jsonl")
+            with open(path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+    # buffer for SQLite ingest; flush every 5 turns so data is persisted incrementally
+    if _sqlite_session_store is not None:
+        try:
+            with _session_buffer_lock:
+                _session_row_buffer.setdefault(session_id, []).append(row)
+                rows = _session_row_buffer[session_id]
+                if len(rows) % 5 == 0:
+                    _sqlite_session_store.ingest(session_id, rows)
+        except Exception:
+            pass
 
 
 app = create_app()

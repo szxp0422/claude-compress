@@ -39,6 +39,8 @@ from ..image_utils import (
     decode_image,
     downscale_to_token_budget,
     encode_image,
+    extract_text_from_image,
+    is_ocr_result_valid,
     pillow_available,
     seam_carve,
     _target_dims_for_budget,
@@ -123,6 +125,7 @@ class ImageCompressStage(Stage):
         seen_hashes: set = set()
         n_deduped = 0
         n_compressed = 0
+        n_ocr_extracted = 0
         visual_tokens_saved = 0
 
         for mi, _bi, block in image_blocks:
@@ -161,6 +164,27 @@ class ImageCompressStage(Stage):
                 img = decode_image(b64_data)
                 content_type = classify_image(img)
 
+                # OCR path: for document_text, extract text and replace the
+                # image block entirely. Text tokens are ~4x cheaper than visual
+                # tokens and the model reads text more reliably than compressed
+                # screenshots. Falls back to downscaling if OCR fails.
+                if self.cfg.ocr_enabled and content_type == "document_text":
+                    extracted = extract_text_from_image(
+                        img, backend=self.cfg.ocr_backend
+                    )
+                    if is_ocr_result_valid(extracted, self.cfg.ocr_min_chars):
+                        # Replace image block with text block in-place.
+                        # The parent list contains this block dict; mutating it
+                        # is safe because _iter_image_blocks returns the dict ref.
+                        block.clear()
+                        block["type"] = "text"
+                        block["text"] = f"[extracted from image]\n{extracted}"
+                        visual_tokens_saved += tok_before
+                        n_compressed += 1
+                        n_ocr_extracted += 1
+                        continue
+                    # OCR returned noise or too little text — fall through to downscale
+
                 img = crop_whitespace(img)
                 img = downscale_to_token_budget(img, budget)
 
@@ -187,6 +211,8 @@ class ImageCompressStage(Stage):
         note_parts = [f"compressed {n_compressed}/{len(image_blocks)} image(s)"]
         if n_deduped:
             note_parts.append(f"stubbed {n_deduped} duplicate(s)")
+        if n_ocr_extracted:
+            note_parts.append(f"OCR-extracted {n_ocr_extracted} doc image(s) to text")
         note_parts.append(f"saved ~{visual_tokens_saved} visual tokens")
         return StageResult(
             self.name,
@@ -197,6 +223,7 @@ class ImageCompressStage(Stage):
                 "images_found": len(image_blocks),
                 "images_compressed": n_compressed,
                 "images_deduped": n_deduped,
+                "images_ocr_extracted": n_ocr_extracted,
                 "visual_tokens_saved": visual_tokens_saved,
             },
         )

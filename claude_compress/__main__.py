@@ -14,6 +14,22 @@ from .server import create_app
 
 
 def main():
+    import sys
+    # check for dream subcommand
+    if len(sys.argv) > 1 and sys.argv[1] == "dream":
+        from .dream import run_dream
+        ap = argparse.ArgumentParser(description="Generate context.md from past sessions")
+        ap.add_argument("dream")  # consume the subcommand
+        ap.add_argument("--limit", type=int, default=30)
+        ap.add_argument("--out", default=None)
+        ap.add_argument("--query", default=None)
+        ap.add_argument("--file", default=None)
+        ap.add_argument("--base-dir", default=None)
+        args = ap.parse_args()
+        run_dream(limit=args.limit, out=args.out, query=args.query,
+                  file_filter=args.file, base_dir=args.base_dir)
+        return
+
     ap = argparse.ArgumentParser(description="claude-compress proxy for Claude Code")
     ap.add_argument("--config", default=None, help="path to JSON config")
     ap.add_argument("--host", default=None)

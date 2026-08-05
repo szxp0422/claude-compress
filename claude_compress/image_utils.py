@@ -355,3 +355,107 @@ def seam_carve(img: "_PILImage.Image", target_width: int) -> "_PILImage.Image":
     if mode != "RGB":
         result = result.convert(mode)
     return result
+
+
+# ---------------------------------------------------------------------------
+# OCR extraction (requires pytesseract + Tesseract binary, or EasyOCR)
+# ---------------------------------------------------------------------------
+
+try:
+    import pytesseract as _pytesseract
+    _TESSERACT_AVAILABLE = True
+except ImportError:
+    _pytesseract = None  # type: ignore
+    _TESSERACT_AVAILABLE = False
+
+try:
+    import easyocr as _easyocr
+    _EASYOCR_AVAILABLE = True
+    _easyocr_reader = None  # lazy-init to avoid loading model at import time
+except ImportError:
+    _easyocr = None  # type: ignore
+    _EASYOCR_AVAILABLE = False
+    _easyocr_reader = None
+
+
+def tesseract_available() -> bool:
+    return _TESSERACT_AVAILABLE
+
+
+def easyocr_available() -> bool:
+    return _EASYOCR_AVAILABLE
+
+
+def ocr_with_tesseract(img: "_PILImage.Image") -> str:
+    """Extract text using pytesseract (wraps local Tesseract binary).
+
+    Best for: terminal output, stack traces, code editors, log files.
+    Poor for: handwriting, low-contrast text, rotated text.
+
+    Install: pip install pytesseract
+             brew install tesseract  (macOS)
+             apt install tesseract-ocr  (Linux)
+    """
+    if not _TESSERACT_AVAILABLE:
+        raise RuntimeError("pytesseract not installed")
+    # PSM 6 = assume uniform block of text — works well for terminal/code screenshots
+    config = "--psm 6 -c preserve_interword_spaces=1"
+    text = _pytesseract.image_to_string(img, config=config)
+    return text.strip()
+
+
+def ocr_with_easyocr(img: "_PILImage.Image") -> str:
+    """Extract text using EasyOCR (local neural OCR, higher accuracy than Tesseract).
+
+    Best for: mixed fonts, non-standard layouts, lower-contrast screenshots.
+    Slower than Tesseract; downloads ~200MB model on first use.
+
+    Install: pip install easyocr
+    """
+    global _easyocr_reader
+    if not _EASYOCR_AVAILABLE:
+        raise RuntimeError("easyocr not installed")
+    if _easyocr_reader is None:
+        _easyocr_reader = _easyocr.Reader(["en"], gpu=False, verbose=False)
+    arr = np.asarray(img.convert("RGB"))
+    results = _easyocr_reader.readtext(arr, detail=0, paragraph=True)
+    return "\n".join(results).strip()
+
+
+def extract_text_from_image(
+    img: "_PILImage.Image",
+    backend: str = "tesseract",
+) -> str:
+    """Extract text from a document_text image using the specified OCR backend.
+
+    backend options:
+      'tesseract' — local Tesseract (fast, good for clean screenshots)
+      'easyocr'   — local neural OCR (slower, better on complex layouts)
+
+    Returns empty string on failure rather than raising — callers should
+    fall back to downscaling when this returns ''.
+    """
+    try:
+        if backend == "easyocr":
+            return ocr_with_easyocr(img)
+        return ocr_with_tesseract(img)
+    except Exception:
+        return ""
+
+
+def is_ocr_result_valid(text: str, min_chars: int = 30) -> bool:
+    """Sanity-check OCR output before replacing an image block with it.
+
+    Rejects:
+    - Too short (likely a misclassified image or failed OCR)
+    - Mostly non-ASCII garbage (corrupted extraction)
+    - Fewer than 3 whitespace-separated tokens (not real text)
+    """
+    if len(text) < min_chars:
+        return False
+    ascii_ratio = sum(1 for c in text if ord(c) < 128) / max(len(text), 1)
+    if ascii_ratio < 0.80:
+        return False
+    if len(text.split()) < 3:
+        return False
+    return True

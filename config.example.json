@@ -11,5 +11,18 @@
 
   "eigencontext": { "enabled": false, "coverage": 0.92, "marker": "<<REF>>", "protect_last_n_messages": 4 },
   "alias":        { "enabled": false, "min_occurrences": 4, "min_length": 24, "max_aliases": 24 },
-  "state_machine":{ "enabled": false }
+  "state_machine":{ "enabled": false },
+
+  "image": {
+    "enabled": false,
+    "protect_last_n_messages": 4,
+    "max_tokens_per_image": 1024,
+    "old_age_threshold_messages": 0,
+    "old_age_max_tokens": 256,
+    "dedup_exact": true,
+    "seam_carve_photos": false,
+    "ocr_enabled": false,
+    "ocr_backend": "tesseract",
+    "ocr_min_chars": 30
+  }
 }

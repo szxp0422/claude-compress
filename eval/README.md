@@ -112,7 +112,8 @@ Image compression has no benchmark data yet. The expected profile — strong sav
 
 - **Visual token savings** — reported directly by the stage as `visual_tokens_saved` in `ccomp_metrics.jsonl`. This is distinct from text token savings and should be reported separately.
 - **Dedup hit rate** — `images_deduped / images_found`. A rate above 50% on computer-use sessions is typical; below 10% suggests few repeated screenshots and the dedup path adds negligible value.
-- **Classification accuracy** — spot-check a sample of images in `ccomp_metrics.jsonl` against the classifier's label (photo / document_text / diagram_ui). Misclassifying a screenshot as a photo risks applying seam carving; misclassifying a photo as document_text only means no seam carving (safe).
+- **Classification accuracy** — spot-check a sample of images in `ccomp_metrics.jsonl` against the classifier's label (photo / document_text / diagram_ui). Misclassifying a screenshot as a photo risks applying seam carving; misclassifying a photo as document_text only means OCR is attempted (fails validation → falls back to downscaling; safe).
+- **OCR extraction rate** — `images_ocr_extracted / images_found`. A rate near zero on a terminal-heavy session means the classifier isn't labelling images as `document_text`; check `classify_image` thresholds. A rate near 1.0 on a UI design session is a red flag — OCR should not be firing on photos or diagrams.
 - **Quality on visual tasks** — use objective checks where possible: OCR-style `contains` checks on text visible in screenshots, or task-completion checks when the agent acts on what it sees.
 
 ### Task format for image-heavy sessions
@@ -137,8 +138,10 @@ Add images to turns using the standard Messages API format. Base64-encoded image
 | `image.enabled=false` | Baseline — no image compression |
 | `image.enabled=true, dedup_exact=true, max_tokens=9999` | Dedup only — measures quality impact of stubbing duplicates |
 | `image.enabled=true, dedup_exact=false, max_tokens=1024` | Resize only — measures quality impact of downscaling |
-| `image.enabled=true` (all defaults) | Full pipeline |
+| `image.enabled=true` (all defaults) | Full pipeline (no OCR) |
 | `image.enabled=true, old_age_threshold=16, old_age_max=256` | Age-based aggressive compression on old screenshots |
+| `image.enabled=true, ocr_enabled=true` | OCR extraction for document_text images — measure quality on text-in-image tasks |
+| `image.enabled=true, ocr_enabled=true, ocr_backend=easyocr` | EasyOCR vs Tesseract — compare extraction accuracy on complex layouts |
 
 ---
 
@@ -167,6 +170,24 @@ python -m eval.run_eval --tasks eval/real_tasks.jsonl \
     --judge-model claude-sonnet-4-6 \
     --margin 0.03 --ablate --out report.md
 ```
+
+### Using the session store as an eval data source
+
+The proxy automatically indexes sessions into `~/.claude-compress/sessions.db`. You can query it directly to find sessions suitable for eval tasks:
+
+```python
+from claude_compress.session_store import SessionStore
+store = SessionStore()
+
+# find sessions that touched a specific file (likely coding tasks)
+for s in store.search_by_file("test_"):
+    print(s.session_id[:8], s.turn_count, "turns —", s.summary[:80])
+
+# check what's stored
+print(store.stats())
+```
+
+Full session JSON (full tier, ≤7 days old) can be loaded with `store.get_full(session_id)` and converted to eval task format with `eval/record_to_tasks.py`.
 
 ## Task file format (JSONL, one task per line)
 
@@ -233,7 +254,7 @@ If you are contributing new language support to the minifier, run the test suite
 > Over 200 multi-turn tasks (avg 9 turns): **41% fewer input tokens** (95% CI 38–44%), **58% lower cost** including cache reads, with mean quality loss **+0.004** (95% CI −0.002 to +0.011) against a δ=0.03 margin → non-inferior. Savings-by-turn stable through turn 12; quality-by-turn flat. Ablation: removing checkpoint drops savings to 9%; removing alias changes nothing → alias disabled.
 
 **Image pipeline (target format once data exists):**
-> Over 50 computer-use tasks (avg 12 turns, avg 8 images/turn): **image dedup** eliminated 63% of visual tokens with zero quality regressions (dedup hit rate 71%); **resize** reduced remaining image tokens by 58% with 2 quality regressions on diagram-heavy tasks where the classifier mislabelled screenshots as photos. Net: visual tokens −84%, text tokens −22%, total cost −61%. Ablation: disabling dedup halves visual savings; disabling resize has negligible quality impact → resize budget raised to 2048 for diagram-heavy workloads.
+> Over 50 computer-use tasks (avg 12 turns, avg 8 images/turn): **image dedup** eliminated 63% of visual tokens with zero quality regressions (dedup hit rate 71%); **OCR extraction** converted 38% of remaining images (classified as document_text) to text blocks saving 82% of their visual tokens with 0 quality regressions on terminal/log tasks; **resize** reduced remaining image tokens by 58% with 2 quality regressions on diagram-heavy tasks where the classifier mislabelled screenshots as photos. Net: visual tokens −91%, text tokens −19% (text stages applied to OCR output), total cost −68%. Ablation: disabling dedup halves visual savings; disabling OCR drops savings to −77%; disabling resize has negligible quality impact → resize budget raised to 2048 for diagram-heavy workloads.
 
 **Format pipeline (target format once data exists):**
 > Over 100 agentic tasks with tool_result blocks (avg 6 turns, avg 3 tool calls/turn): **json_compress** reduced JSON payload tokens by 34% (blocks_compressed rate 61%, no quality regressions — truncated fields never referenced downstream); **log_compress** reduced log/trace tokens by 58% (repeated-line collapse accounted for 40%, frame truncation 60%); **html_compress** (enabled on web-scraping subset, 30 tasks) reduced HTML tokens by 71% with 1 regression where a navigation link was load-bearing. Net: tool_result tokens −44%, total tokens −18%, total cost −22% (additive with text pipeline). Ablation: disabling json_compress alone drops savings to −12%; disabling log_compress drops to −8%; html step-aside for non-HTML content is zero-cost.
