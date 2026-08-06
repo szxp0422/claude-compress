@@ -92,6 +92,20 @@ class ImageConfig:
     # minimum character count for OCR output to be accepted (filters noise)
     ocr_min_chars: int = 30
 
+    # Zone segmentation: split mixed images into typed regions and handle each
+    # independently (text zones → OCR, image zones → compress). Disabled by
+    # default — useful for large screenshots with mixed content (IDE, browser).
+    zone_segment: bool = False
+    # Minimum image area (pixels) to attempt zone segmentation. Small images
+    # are unlikely to contain multiple zones worth splitting.
+    zone_min_area: int = 80000   # roughly 320x250px
+    # RLSA horizontal gap threshold: larger = more aggressive word merging
+    zone_h_threshold: int = 20
+    # RLSA vertical gap threshold: larger = more aggressive line merging
+    zone_v_threshold: int = 30
+    # Minimum area of a zone blob to be kept (filters noise)
+    zone_min_zone_area: int = 2000
+
 
 @dataclass
 class DedupConfig:

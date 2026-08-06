@@ -114,6 +114,7 @@ Image compression has no benchmark data yet. The expected profile — strong sav
 - **Dedup hit rate** — `images_deduped / images_found`. A rate above 50% on computer-use sessions is typical; below 10% suggests few repeated screenshots and the dedup path adds negligible value.
 - **Classification accuracy** — spot-check a sample of images in `ccomp_metrics.jsonl` against the classifier's label (photo / document_text / diagram_ui). Misclassifying a screenshot as a photo risks applying seam carving; misclassifying a photo as document_text only means OCR is attempted (fails validation → falls back to downscaling; safe).
 - **OCR extraction rate** — `images_ocr_extracted / images_found`. A rate near zero on a terminal-heavy session means the classifier isn't labelling images as `document_text`; check `classify_image` thresholds. A rate near 1.0 on a UI design session is a red flag — OCR should not be firing on photos or diagrams.
+- **Zone segmentation rate** — `images_zone_segmented / images_found`. A low rate on mixed-content screenshots means `zone_min_area` is too large or `zone_min_zone_area` is filtering out real zones. Spot-check a sample of zone counts per image to confirm multi-zone splits are happening where expected. Include dark-themed terminal screenshots in the test set — the binarizer auto-inverts for dark backgrounds, so these should now zone-detect correctly; a rate near zero on a terminal-heavy set is a sign of a regression to investigate.
 - **Quality on visual tasks** — use objective checks where possible: OCR-style `contains` checks on text visible in screenshots, or task-completion checks when the agent acts on what it sees.
 
 ### Task format for image-heavy sessions
@@ -142,6 +143,8 @@ Add images to turns using the standard Messages API format. Base64-encoded image
 | `image.enabled=true, old_age_threshold=16, old_age_max=256` | Age-based aggressive compression on old screenshots |
 | `image.enabled=true, ocr_enabled=true` | OCR extraction for document_text images — measure quality on text-in-image tasks |
 | `image.enabled=true, ocr_enabled=true, ocr_backend=easyocr` | EasyOCR vs Tesseract — compare extraction accuracy on complex layouts |
+| `image.enabled=true, zone_segment=true` | Zone segmentation alone — measures quality impact of splitting mixed images |
+| `image.enabled=true, zone_segment=true, ocr_enabled=true` | Full pipeline — zone split + OCR text zones + compress image zones |
 
 ---
 

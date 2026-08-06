@@ -180,7 +180,7 @@ class SessionStore:
                 ORDER BY s.updated_at DESC
                 LIMIT ?
             """, (f"%{file_path}%", limit)).fetchall()
-        return [self._row_to_meta(r) for r in rows]
+        return self._rows_to_metas(rows)
 
     def search_by_text(self, query: str, limit: int = 10) -> List[SessionMeta]:
         """Find sessions whose summary contains the query string."""
@@ -193,7 +193,7 @@ class SessionStore:
                 ORDER BY updated_at DESC
                 LIMIT ?
             """, (f"%{query}%", limit)).fetchall()
-        return [self._row_to_meta(r) for r in rows]
+        return self._rows_to_metas(rows)
 
     def recent(self, limit: int = 20) -> List[SessionMeta]:
         """Return the most recently updated sessions."""
@@ -205,7 +205,7 @@ class SessionStore:
                 ORDER BY updated_at DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-        return [self._row_to_meta(r) for r in rows]
+        return self._rows_to_metas(rows)
 
     def get_full(self, session_id: str) -> Optional[list]:
         """Load full session rows if available (full tier only)."""
@@ -253,15 +253,14 @@ class SessionStore:
 
                 # summary → index
                 rows = conn.execute("""
-                    SELECT s.session_id,
-                           GROUP_CONCAT(f.file_path, '|') AS paths
-                    FROM sessions s
-                    LEFT JOIN session_files f ON s.session_id = f.session_id
-                    WHERE s.tier = 'summary' AND s.updated_at < ?
-                    GROUP BY s.session_id
+                    SELECT session_id FROM sessions
+                    WHERE tier = 'summary' AND updated_at < ?
                 """, (summary_cutoff,)).fetchall()
-                for sid, paths_str in rows:
-                    paths = paths_str.split("|") if paths_str else []
+                for (sid,) in rows:
+                    paths = [r[0] for r in conn.execute(
+                        "SELECT file_path FROM session_files WHERE session_id = ?",
+                        (sid,)
+                    ).fetchall()]
                     i_path = self.index_dir / f"{sid}.json"
                     i_path.write_text(json.dumps({"file_paths": paths}))
                     s_path = self.summary_dir / f"{sid}.json"
@@ -308,20 +307,35 @@ class SessionStore:
         result["db_size_bytes"] = db_size
         return result
 
-    def _row_to_meta(self, row: tuple) -> SessionMeta:
-        sid, created, updated, turns, tokens, summary, tier = row
+    def _rows_to_metas(self, rows: list) -> List[SessionMeta]:
+        """Convert a list of session DB rows to SessionMeta objects.
+
+        Fetches all file paths in a single query rather than one per session,
+        avoiding the N+1 problem when returning multiple results.
+        """
+        if not rows:
+            return []
+        sids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(sids))
         with sqlite3.connect(self.db_path) as conn:
-            paths = [r[0] for r in conn.execute(
-                "SELECT file_path FROM session_files WHERE session_id = ?",
-                (sid,)
-            ).fetchall()]
-        return SessionMeta(
-            session_id=sid,
-            created_at=created,
-            updated_at=updated,
-            turn_count=turns,
-            token_count=tokens,
-            summary=summary,
-            file_paths=paths,
-            tier=tier,
-        )
+            file_rows = conn.execute(
+                f"SELECT session_id, file_path FROM session_files "
+                f"WHERE session_id IN ({placeholders})",
+                sids,
+            ).fetchall()
+        paths_by_sid: dict = {}
+        for sid, path in file_rows:
+            paths_by_sid.setdefault(sid, []).append(path)
+        return [
+            SessionMeta(
+                session_id=r[0],
+                created_at=r[1],
+                updated_at=r[2],
+                turn_count=r[3],
+                token_count=r[4],
+                summary=r[5],
+                file_paths=paths_by_sid.get(r[0], []),
+                tier=r[6],
+            )
+            for r in rows
+        ]

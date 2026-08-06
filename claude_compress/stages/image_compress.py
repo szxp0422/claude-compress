@@ -32,6 +32,7 @@ from ..tokens import count_request
 from ..image_utils import (
     STUB_MEDIA_TYPE,
     STUB_PNG_B64,
+    ImageZone,
     classify_image,
     count_image_block_tokens,
     count_image_tokens,
@@ -43,6 +44,7 @@ from ..image_utils import (
     is_ocr_result_valid,
     pillow_available,
     seam_carve,
+    segment_zones,
     _target_dims_for_budget,
 )
 from .base import Stage, StageResult
@@ -97,6 +99,65 @@ def _image_hash(b64_data: str) -> str:
     return hashlib.sha256(b64_data[:65536].encode()).hexdigest()
 
 
+def _compress_zone(
+    zone: "ImageZone",
+    cfg: "ImageConfig",
+    tok_budget: int,
+    ocr_enabled: bool = False,
+    ocr_backend: str = "tesseract",
+    ocr_min_chars: int = 30,
+) -> "dict | str":
+    """Compress one ImageZone into either an image block dict or a text string.
+
+    Returns:
+        dict — a complete image content block (type: "image")
+        str  — extracted text (type: "text", caller wraps)
+
+    Never raises — returns the original zone as a minimally-compressed image
+    block on any error.
+    """
+    img = zone.img
+    media_type = "image/png"
+
+    # Text zones: attempt OCR first if enabled
+    if ocr_enabled and zone.zone_type == "document_text":
+        try:
+            text = extract_text_from_image(img, backend=ocr_backend)
+            if is_ocr_result_valid(text, min_chars=ocr_min_chars):
+                return text
+        except Exception:
+            pass  # fall through to image compression
+
+    # Image zones (or OCR fallback): compress to token budget
+    try:
+        img = crop_whitespace(img)
+        img = downscale_to_token_budget(img, tok_budget)
+
+        if (
+            cfg.seam_carve_photos
+            and zone.zone_type == "photo"
+            and count_image_tokens(*img.size) > tok_budget
+        ):
+            target_w, _ = _target_dims_for_budget(*img.size, tok_budget)
+            img = seam_carve(img, target_w)
+
+        new_b64, new_media_type = encode_image(img, media_type)
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": new_media_type,
+                "data": new_b64,
+            },
+        }
+    except Exception:
+        try:
+            b64, mt = encode_image(zone.img, media_type)
+            return {"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}}
+        except Exception:
+            return {"type": "image", "source": {"type": "base64", "media_type": STUB_MEDIA_TYPE, "data": STUB_PNG_B64}}
+
+
 class ImageCompressStage(Stage):
     name = "image_compress"
 
@@ -126,6 +187,7 @@ class ImageCompressStage(Stage):
         n_deduped = 0
         n_compressed = 0
         n_ocr_extracted = 0
+        n_zone_segmented = 0
         visual_tokens_saved = 0
 
         for mi, _bi, block in image_blocks:
@@ -159,31 +221,98 @@ class ImageCompressStage(Stage):
             if tok_before <= budget:
                 continue  # already within budget
 
-            # --- Step 3: compress ---
+            # --- Step 3: compress (with optional zone segmentation) ---
             try:
                 img = decode_image(b64_data)
+                iw, ih = img.size
+
+                # Zone segmentation path: split mixed images into typed regions
+                # and handle each independently. Only when the image is large
+                # enough to plausibly contain multiple zones.
+                if (
+                    self.cfg.zone_segment
+                    and iw * ih >= self.cfg.zone_min_area
+                ):
+                    zones = segment_zones(
+                        img,
+                        h_threshold=self.cfg.zone_h_threshold,
+                        v_threshold=self.cfg.zone_v_threshold,
+                        min_zone_area=self.cfg.zone_min_zone_area,
+                    )
+
+                    if len(zones) > 1:
+                        replacement_blocks = []
+                        for zone in zones:
+                            result = _compress_zone(
+                                zone,
+                                self.cfg,
+                                tok_budget=budget,
+                                ocr_enabled=self.cfg.ocr_enabled,
+                                ocr_backend=self.cfg.ocr_backend,
+                                ocr_min_chars=self.cfg.ocr_min_chars,
+                            )
+                            if isinstance(result, str):
+                                replacement_blocks.append({
+                                    "type": "text",
+                                    "text": f"[extracted from image zone]\n{result}",
+                                })
+                                n_ocr_extracted += 1
+                            else:
+                                replacement_blocks.append(result)
+
+                        # Splice replacement_blocks into the parent content list.
+                        msgs = request.get("messages", [])
+                        replaced = False
+                        for msg in msgs:
+                            if replaced:
+                                break
+                            content = msg.get("content")
+                            if not isinstance(content, list):
+                                continue
+                            for idx, b in enumerate(content):
+                                if b is block:
+                                    content[idx:idx + 1] = replacement_blocks
+                                    replaced = True
+                                    break
+                                if isinstance(b, dict) and b.get("type") == "tool_result":
+                                    inner = b.get("content")
+                                    if isinstance(inner, list):
+                                        for iidx, ib in enumerate(inner):
+                                            if ib is block:
+                                                inner[iidx:iidx + 1] = replacement_blocks
+                                                replaced = True
+                                                break
+                                if replaced:
+                                    break
+
+                        tok_after = sum(
+                            count_image_block_tokens(b)
+                            for b in replacement_blocks
+                            if b.get("type") == "image"
+                        )
+                        visual_tokens_saved += max(0, tok_before - tok_after)
+                        n_compressed += 1
+                        n_zone_segmented += 1
+                        continue
+
+                # Normal single-block path (zone_segment off, or single zone found)
                 content_type = classify_image(img)
 
-                # OCR path: for document_text, extract text and replace the
-                # image block entirely. Text tokens are ~4x cheaper than visual
-                # tokens and the model reads text more reliably than compressed
-                # screenshots. Falls back to downscaling if OCR fails.
                 if self.cfg.ocr_enabled and content_type == "document_text":
-                    extracted = extract_text_from_image(
-                        img, backend=self.cfg.ocr_backend
-                    )
-                    if is_ocr_result_valid(extracted, self.cfg.ocr_min_chars):
-                        # Replace image block with text block in-place.
-                        # The parent list contains this block dict; mutating it
-                        # is safe because _iter_image_blocks returns the dict ref.
-                        block.clear()
-                        block["type"] = "text"
-                        block["text"] = f"[extracted from image]\n{extracted}"
-                        visual_tokens_saved += tok_before
-                        n_compressed += 1
-                        n_ocr_extracted += 1
-                        continue
-                    # OCR returned noise or too little text — fall through to downscale
+                    try:
+                        extracted = extract_text_from_image(
+                            img, backend=self.cfg.ocr_backend
+                        )
+                        if is_ocr_result_valid(extracted, self.cfg.ocr_min_chars):
+                            block.clear()
+                            block["type"] = "text"
+                            block["text"] = f"[extracted from image]\n{extracted}"
+                            visual_tokens_saved += tok_before
+                            n_compressed += 1
+                            n_ocr_extracted += 1
+                            continue
+                    except Exception:
+                        pass
 
                 img = crop_whitespace(img)
                 img = downscale_to_token_budget(img, budget)
@@ -212,7 +341,9 @@ class ImageCompressStage(Stage):
         if n_deduped:
             note_parts.append(f"stubbed {n_deduped} duplicate(s)")
         if n_ocr_extracted:
-            note_parts.append(f"OCR-extracted {n_ocr_extracted} doc image(s) to text")
+            note_parts.append(f"OCR-extracted {n_ocr_extracted} zone(s) to text")
+        if n_zone_segmented:
+            note_parts.append(f"zone-segmented {n_zone_segmented} image(s)")
         note_parts.append(f"saved ~{visual_tokens_saved} visual tokens")
         return StageResult(
             self.name,
@@ -224,6 +355,7 @@ class ImageCompressStage(Stage):
                 "images_compressed": n_compressed,
                 "images_deduped": n_deduped,
                 "images_ocr_extracted": n_ocr_extracted,
+                "images_zone_segmented": n_zone_segmented,
                 "visual_tokens_saved": visual_tokens_saved,
             },
         )

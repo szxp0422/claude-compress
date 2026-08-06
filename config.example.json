@@ -23,6 +23,11 @@
     "seam_carve_photos": false,
     "ocr_enabled": false,
     "ocr_backend": "tesseract",
-    "ocr_min_chars": 30
+    "ocr_min_chars": 30,
+    "zone_segment": false,
+    "zone_min_area": 80000,
+    "zone_h_threshold": 20,
+    "zone_v_threshold": 30,
+    "zone_min_zone_area": 2000
   }
 }

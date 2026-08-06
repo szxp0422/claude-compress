@@ -459,3 +459,205 @@ def is_ocr_result_valid(text: str, min_chars: int = 30) -> bool:
     if len(text.split()) < 3:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Zone segmentation (RLSA — Run-Length Smoothing Algorithm)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dataclass
+from typing import List as _List
+
+
+@_dataclass
+class ImageZone:
+    """A detected region within an image with its bounding box and type."""
+    x: int
+    y: int
+    w: int
+    h: int
+    zone_type: str  # 'document_text', 'diagram_ui', or 'photo'
+    img: "_PILImage.Image"  # cropped sub-image
+
+
+def _rlsa_horizontal(binary: np.ndarray, threshold: int) -> np.ndarray:
+    """Fill horizontal gaps ≤ threshold pixels wide with black (0).
+
+    Vectorized: iterates over black-pixel indices per row rather than every
+    pixel, reducing inner work from O(W) to O(blacks_per_row).
+    """
+    result = binary.copy()
+    for row in range(binary.shape[0]):
+        blacks = np.where(binary[row] == 0)[0]
+        if len(blacks) < 2:
+            continue
+        gaps = blacks[1:] - blacks[:-1] - 1  # gap widths between consecutive blacks
+        for i in np.where(gaps <= threshold)[0]:
+            result[row, blacks[i] + 1 : blacks[i + 1]] = 0
+    return result
+
+
+def _rlsa_vertical(binary: np.ndarray, threshold: int) -> np.ndarray:
+    """Fill vertical gaps ≤ threshold pixels tall with black (0).
+
+    Vectorized: iterates over black-pixel indices per column rather than every
+    pixel, reducing inner work from O(H) to O(blacks_per_col).
+    """
+    result = binary.copy()
+    for col in range(binary.shape[1]):
+        blacks = np.where(binary[:, col] == 0)[0]
+        if len(blacks) < 2:
+            continue
+        gaps = blacks[1:] - blacks[:-1] - 1
+        for i in np.where(gaps <= threshold)[0]:
+            result[blacks[i] + 1 : blacks[i + 1], col] = 0
+    return result
+
+
+def _find_connected_components(binary: np.ndarray, min_area: int = 500):
+    """Find bounding boxes of row-projected bands in a binarised image."""
+    h, w = binary.shape
+    row_density = (binary == 0).sum(axis=1) / w
+
+    ROW_THRESH = 0.03
+    in_band = False
+    bands = []
+    band_start = 0
+    for r in range(h):
+        if not in_band and row_density[r] > ROW_THRESH:
+            in_band = True
+            band_start = r
+        elif in_band and row_density[r] <= ROW_THRESH:
+            in_band = False
+            if r - band_start >= 4:
+                bands.append((band_start, r))
+    if in_band:
+        bands.append((band_start, h))
+
+    boxes = []
+    for (r0, r1) in bands:
+        band_slice = binary[r0:r1, :]
+        col_d = (band_slice == 0).sum(axis=0) / max(r1 - r0, 1)
+        active_cols = np.where(col_d > 0.01)[0]
+        if len(active_cols) == 0:
+            continue
+        x0 = int(active_cols[0])
+        x1 = int(active_cols[-1]) + 1
+        bw = x1 - x0
+        bh = r1 - r0
+        if bw * bh >= min_area:
+            boxes.append((x0, r0, bw, bh))
+
+    return boxes
+
+
+def _classify_zone(arr: np.ndarray) -> str:
+    """Classify a sub-image zone (numpy RGB array) using the same heuristics as classify_image."""
+    h, w = arr.shape[:2]
+    if h < 8 or w < 8:
+        return "diagram_ui"
+
+    scale = min(1.0, 256.0 / max(h, w))
+    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+    step_h = max(1, h // nh)
+    step_w = max(1, w // nw)
+    small = arr[::step_h, ::step_w]
+
+    gray = small.mean(axis=2) / 255.0
+
+    rgb5 = (small >> 3).astype(np.uint32)
+    packed = rgb5[:, :, 0] * 1024 + rgb5[:, :, 1] * 32 + rgb5[:, :, 2]
+    n_distinct = len(np.unique(packed))
+    color_entropy = n_distinct / max(gray.shape[0] * gray.shape[1], 1)
+
+    dy = np.abs(np.diff(gray, axis=0, prepend=gray[:1]))
+    dx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    edge_density = float(np.mean((dx + dy) > 0.05))
+
+    row_variance = float(np.var(gray.mean(axis=1)))
+
+    if color_entropy > 0.15:
+        return "photo"
+    if edge_density > 0.12 and row_variance > 0.005:
+        return "document_text"
+    return "diagram_ui"
+
+
+def segment_zones(
+    img: "_PILImage.Image",
+    h_threshold: int = 20,
+    v_threshold: int = 30,
+    min_zone_area: int = 2000,
+    min_zone_height: int = 20,
+    min_zone_width: int = 40,
+) -> "_List[ImageZone]":
+    """Split a mixed image into typed zones using RLSA.
+
+    Returns zones sorted top-to-bottom, left-to-right. If segmentation finds
+    only one zone covering >85% of the image, returns a single zone with the
+    whole image classified — equivalent to the existing whole-image path.
+    """
+    iw, ih = img.size
+
+    # Downscale before RLSA — zone detection doesn't need full resolution.
+    # Capping at 800px max dimension gives ~4x speedup on 1080p screenshots
+    # with no meaningful loss in zone boundary accuracy.
+    _MAX_RLSA_DIM = 800
+    rlsa_scale = min(1.0, _MAX_RLSA_DIM / max(iw, ih))
+    if rlsa_scale < 1.0:
+        rlsa_w = max(1, int(iw * rlsa_scale))
+        rlsa_h = max(1, int(ih * rlsa_scale))
+        rlsa_img = img.resize((rlsa_w, rlsa_h), _PILImage.NEAREST)
+    else:
+        rlsa_img = img
+
+    gray_arr = np.asarray(rlsa_img.convert("L"), dtype=np.uint8)
+
+    # Adaptive binarisation: for dark-background screenshots (terminals, dark
+    # editors) the midpoint threshold maps the background to "foreground" and
+    # produces one useless blob. If >50% of pixels would be foreground, invert.
+    lo, hi = int(gray_arr.min()), int(gray_arr.max())
+    thresh = (lo + hi) // 2 if hi > lo else 128
+    binary_img = np.where(gray_arr < thresh, 0, 255).astype(np.uint8)
+    if (binary_img == 0).mean() > 0.5:
+        binary_img = 255 - binary_img  # dark background — invert so text is foreground
+
+    # RLSA: smooth horizontally then vertically
+    smoothed_h = _rlsa_horizontal(binary_img, h_threshold)
+    smoothed = _rlsa_vertical(smoothed_h, v_threshold)
+
+    # Scale min_zone_area to match the downscaled resolution, find blobs
+    scaled_min_area = max(1, int(min_zone_area * rlsa_scale * rlsa_scale))
+    boxes = _find_connected_components(smoothed, min_area=scaled_min_area)
+
+    # Scale bounding boxes back to original image coordinates
+    inv = 1.0 / rlsa_scale
+    boxes = [(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in boxes]
+
+    # Filter degenerate zones
+    boxes = [
+        (x, y, w, h) for (x, y, w, h) in boxes
+        if w >= min_zone_width and h >= min_zone_height
+    ]
+
+    if not boxes:
+        arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+        return [ImageZone(0, 0, iw, ih, _classify_zone(arr), img)]
+
+    total_area = iw * ih
+    if len(boxes) == 1:
+        x, y, w, h = boxes[0]
+        if (w * h) / total_area > 0.85:
+            arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+            return [ImageZone(x, y, w, h, _classify_zone(arr), img.crop((x, y, x + w, y + h)))]
+
+    rgb_arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    zones: "_List[ImageZone]" = []
+    for (x, y, w, h) in sorted(boxes, key=lambda b: (b[1], b[0])):
+        x2, y2 = min(x + w, iw), min(y + h, ih)
+        crop = img.crop((x, y, x2, y2))
+        crop_arr = rgb_arr[y:y2, x:x2]
+        zone_type = _classify_zone(crop_arr)
+        zones.append(ImageZone(x, y, w, h, zone_type, crop))
+
+    return zones

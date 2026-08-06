@@ -13,6 +13,7 @@ The checkpoint summariser reuses those same credentials for a cheap side-call.
 """
 from __future__ import annotations
 
+import atexit
 import asyncio
 import os
 import json
@@ -130,6 +131,19 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     if any(v > 0 for v in _retention_stats.values()):
         logger.info("session retention: %s", _retention_stats)
     _sqlite_session_store = _sqlite_store
+
+    # Flush any buffered session rows on process exit so sessions with <5 turns
+    # aren't lost from the SQLite index when the proxy shuts down.
+    def _flush_on_exit():
+        with _session_buffer_lock:
+            for sid, rows in list(_session_row_buffer.items()):
+                if rows:
+                    try:
+                        _sqlite_session_store.ingest(sid, rows)
+                    except Exception:
+                        pass
+
+    atexit.register(_flush_on_exit)
 
     @app.get("/healthz")
     async def healthz():
