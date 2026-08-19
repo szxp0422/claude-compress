@@ -14,3 +14,7 @@ tiktoken>=0.7.0
 #                                       #   brew install tesseract  (macOS)
 #                                       #   apt install tesseract-ocr  (Linux)
 #   pip install easyocr                 # slower, better accuracy, no binary dep
+
+# optional: video input stage (video_compress) + standalone transcription scripts
+#   pip install opencv-python           # frame extraction (required for video)
+#   pip install pytesseract             # OCR backend (already listed above)

@@ -79,6 +79,44 @@ Add `tool_result` turns directly in the task JSONL. Use `check` conditions to ve
 
 ---
 
+## Evaluating video compression
+
+The `video_compress` stage has no benchmark data yet. It converts `type: "video"` content blocks to OCR text transcriptions before forwarding to Claude, so savings are structural (visual tokens → text tokens) and quality depends entirely on OCR accuracy for the specific recording.
+
+### What to measure
+
+- **Conversion rate** — `videos_converted / videos_found` in `ccomp_metrics.jsonl`. A rate near zero means video blocks are not being detected (check the source format) or OCR is returning empty strings (check anchor/ROI settings).
+- **Transcript fidelity** — spot-check the `.jsonl` scene files or the injected text block against the video. Key content (function signatures, error messages, filenames) should be present; UI chrome and repeated frames should not inflate the output.
+- **Scene routing accuracy** — when `--output-dir` is used, verify that `scene_index.json` lists the expected scenes and that content from one open file did not leak into another scene's JSONL.
+- **Quality on downstream tasks** — use `contains` checks on facts visible in the recording (function names, error codes, variable values) as objective quality gates.
+
+### Task format for video sessions
+
+Video content is not yet part of the standard Messages API; inject it as a custom block in the task JSONL:
+
+```json
+{"id": "video-code-review",
+ "turns": [
+   {"user": "Here is a recording of the bug.", "video": [
+     {"type": "path", "path": "/abs/path/to/recording.mp4"}
+   ]},
+   {"user": "What is the root cause?",
+    "check": {"type": "contains", "value": "NullPointerException"}}
+ ]}
+```
+
+### Recommended ablation matrix for video sessions
+
+| Config | What it isolates |
+|---|---|
+| `video.enabled=false` | Baseline — video block passed as-is (Claude will reject it) |
+| `video.enabled=true, anchor_text=""` | Auto-detect ROI — tests frame-diff ROI detection |
+| `video.enabled=true, anchor_text="VS Code"` | Anchor tracking — tests OCR-based ROI derivation |
+| `video.enabled=true, anchor_text="VS Code", ocr_every_n_frames=1` | Maximum fidelity — every frame OCR'd |
+| `video.enabled=true, ocr_backend=easyocr` | EasyOCR vs Tesseract — compare transcript quality on complex layouts |
+
+---
+
 ## Evidence hierarchy (weakest → strongest)
 
 1. **Estimated token reduction** — the proxy's heuristic counter. Useful for tuning; not proof. It's an estimate and says nothing about quality.

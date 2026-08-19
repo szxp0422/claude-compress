@@ -175,6 +175,40 @@ class AliasConfig:
 
 
 @dataclass
+class VideoConfig:
+    # Convert video content blocks to OCR text transcriptions.
+    # Disabled by default — enable for recordings/screencasts passed as video blocks.
+    # Requires: pip install opencv-python pytesseract && brew install tesseract
+    enabled: bool = False
+    # Never process video blocks in the last N messages (live working set).
+    protect_last_n_messages: int = 4
+
+    # --- ROI / tracker settings ---
+    # Fixed content region (x, y, w, h). None = auto-detect or full frame.
+    roi: list = None  # type: ignore[assignment]
+    # Use optical-flow drift correction when roi is fixed.
+    stabilize: bool = False
+    max_drift_px: int = 10
+
+    # Text-anchor tracking (re-locates a UI string via OCR to derive the ROI).
+    # If set, takes priority over roi/stabilize.
+    anchor_text: str = ""
+    offset_y: int = 28
+    offset_x: int = 0
+    content_height: int = 0   # 0 = to frame bottom
+    content_width: int = 0    # 0 = to frame right edge
+    search_region: list = None  # type: ignore[assignment]
+    redetect_every: int = 15
+    fuzzy_threshold: float = 0.7
+
+    # --- OCR / frame sampling ---
+    ocr_backend: str = "tesseract"   # 'tesseract' or 'easyocr'
+    ocr_every_n_frames: int = 5      # run OCR every N frames
+    change_threshold: float = 0.15   # min text-difference ratio to emit a segment
+    max_frames: int = 0              # 0 = process entire video
+
+
+@dataclass
 class StateMachineConfig:
     # Opt-in. If the client passes a `_fsm` hint in metadata, inject a compact
     # transition table instead of prose workflow instructions.
@@ -209,6 +243,7 @@ class Config:
     state_machine: StateMachineConfig = field(default_factory=StateMachineConfig)
     tier: TierConfig = field(default_factory=TierConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)
     json: JsonConfig = field(default_factory=JsonConfig)
     log: LogConfig = field(default_factory=LogConfig)
     html: HtmlConfig = field(default_factory=HtmlConfig)
@@ -254,6 +289,8 @@ def load_config(path: Optional[str] = None) -> Config:
             cfg.tier = _coerce(TierConfig, raw["tier"])
         if "image" in raw:
             cfg.image = _coerce(ImageConfig, raw["image"])
+        if "video" in raw:
+            cfg.video = _coerce(VideoConfig, raw["video"])
         if "json" in raw:
             cfg.json = _coerce(JsonConfig, raw["json"])
         if "log" in raw:

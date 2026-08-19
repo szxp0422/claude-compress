@@ -35,6 +35,7 @@ from .stages.delta import DeltaStage
 from .stages.eigencontext import EigencontextStage
 from .stages.html_compress import HtmlCompressStage
 from .stages.image_compress import ImageCompressStage
+from .stages.video_compress import VideoCompressStage
 from .stages.json_compress import JsonCompressStage
 from .stages.log_compress import LogCompressStage
 from .stages.state_machine import StateMachineStage
@@ -47,6 +48,7 @@ class Pipeline:
         self.stages = [
             # Format-specific stages run first so checkpoint and dedup see
             # already-compressed tool results.
+            VideoCompressStage(cfg.video),
             ImageCompressStage(cfg.image),
             JsonCompressStage(cfg.json),
             LogCompressStage(cfg.log),
@@ -79,6 +81,7 @@ class Pipeline:
             # tool_result structure and add overhead without benefit.
             # Format stages (image, json, log, html) are especially valuable here.
             safe_for_tools = {
+                "video_compress",
                 "image_compress",
                 "json_compress",
                 "log_compress",

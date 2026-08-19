@@ -96,6 +96,7 @@ The Messages API is stateless, so middleware cannot hide context from Claude. Ea
 | `log_compress` | **on** | safe | Compresses shell output, log streams, and exception traces in `tool_result` blocks. Two passes: (1) collapses consecutive identical lines to `[above line repeated ×N]`; (2) truncates long stack-frame runs to head + tail with a `[N frames omitted]` gap. Both passes are self-gating — no-op on non-log content. Detects Python, Java/Kotlin, Node.js/V8, GDB/LLDB, and macOS crash frames. |
 | `html_compress` | off | safe | Strips HTML boilerplate from `tool_result` blocks and converts semantic content to markdown-adjacent text using stdlib `html.parser`. Drops `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>`, `<aside>`, `<form>`, and other non-content tags. Converts headings to `# …` markdown, preserves `<pre>` blocks as code fences, converts lists to `- item` lines. Disabled by default: enable for web-scraping workloads; leave off if the HTML structure itself is the subject of the session. |
 | `image_compress` | off | **lossy** | Reduces the visual-token cost of image blocks in conversation history. Works in three passes: (1) **exact dedup** — replaces repeated screenshots with a 1×1 stub (saves 100% of duplicate tokens, especially valuable in computer-use sessions); (2) **age-based budget** — applies a stricter token limit to very old images; (3) **compress** — classifies each image as photo / document_text / diagram_ui via cheap numpy heuristics, then either (a) **zone-segments** mixed images (vectorized RLSA, pre-scaled to 800px for large images; automatically handles dark-background terminal and dark-mode editor screenshots) into typed regions and handles each independently, (b) **OCR-extracts** `document_text` images to a text block (75–90% savings, off by default), or (c) crops whitespace and downscales to a per-image token budget. Seam carving for photos is available but off by default. Requires Pillow. Token counting covers PNG, JPEG, GIF, and WebP (VP8X). |
+| `video_compress` | off | **lossy** | Converts `type: "video"` content blocks (base64-encoded data or a local `source.type: "path"` reference) to OCR text transcriptions before forwarding to Claude, which does not natively accept video. Three ROI modes: (1) **fixed ROI** (`video.roi`) — fastest, use when the recording is stable; (2) **text-anchor tracking** (`video.anchor_text`) — re-locates a known UI string (window title, tab name) via Tesseract each N frames and derives the content area from calibrated offsets; (3) **auto-detect** — samples frames and uses pixel-change frequency to guess the content region. Optical-flow drift correction is available for wobbly recordings. Self-disables gracefully when `opencv-python` or an OCR backend is absent. See also the standalone transcription scripts below. |
 | `eigencontext` | off | **lossy** | Greedy max-coverage sentence selection over `<<REF>>`-tagged reference blocks only. Disabled by default: dropping context from a coding agent is risky. |
 | `alias_substitution` | off | **risky** | Replaces long repeated strings with short aliases and a legend; expands them back in the response. Only profitable when a string repeats 8+ times; marginal wins on most sessions. |
 | `state_machine` | off | n/a | If the client passes a `metadata._fsm` spec, injects a compact transition table instead of prose workflow text. |
@@ -149,6 +150,84 @@ The non-inferiority test checks whether the upper CI bound of the quality loss i
 $$n \geq \left(\frac{1.96 \times 0.5}{0.03 - (-0.2)}\right)^2 \approx 18$$
 
 Roughly 18 scored turns are needed to formally pass. The current dataset has 10, which is why the FAIL label appears despite compressed winning 5–7 of 10 judged turns in every configuration. The math and the direction of results are consistent — the gap is sample size only.
+
+## Video transcription scripts
+
+Three standalone scripts convert a screen-recording into text that can be fed into Claude. They run independently of the proxy — no API key required.
+
+### Workflow
+
+**Step 1 — calibrate** (find the right anchor and offsets):
+```bash
+python calibrate_anchor.py myvideo.mp4 "VS Code" --offset-y 28
+```
+Opens a preview frame with the anchor text (yellow box) and derived content ROI (green box). Adjust `--offset-y` until the green box covers the scrolling area, then copy the printed command.
+
+**Step 2 — transcribe**:
+```bash
+# anchor tracking, auto content size
+python video_transcribe_roi.py myvideo.mp4 --anchor "VS Code" --offset-y 28
+
+# with fixed content dimensions and a restricted search area for speed
+python video_transcribe_roi.py myvideo.mp4 \
+    --anchor "VS Code" --offset-y 28 \
+    --content-height 600 --content-width 900 \
+    --search-region 0 0 400 60
+
+# scene-split mode: separate JSONL per open file, identified by pHash + tab OCR
+python video_transcribe_roi.py myvideo.mp4 \
+    --anchor "VS Code" --offset-y 28 \
+    --output-dir my_video_scenes/ \
+    --tab-region 0 40 1200 28 \
+    --check-tab-every 3
+```
+
+### ROI tracker modes
+
+| Mode | Flag | Best for |
+|---|---|---|
+| Fixed ROI | `--roi X Y W H` | Stable recordings with no drift |
+| Optical-flow | `--roi … --stabilize` | Slightly wobbly recordings |
+| Auto-detect | `--auto-roi` | Quick first pass when ROI is unknown |
+| Text-anchor | `--anchor TEXT --offset-y N` | Recordings where the UI chrome can shift; anchor re-located via OCR every N frames |
+
+### Scene-split output (`--output-dir`)
+
+When `--output-dir` is set, `scene_manager.py` routes OCR output to per-scene JSONL files using two-level identity:
+
+1. **pHash** — perceptual hash detects window/layout changes.
+2. **Tab OCR** — reads the active editor tab filename; if the same window shows a different file, a new scene file is created without needing a layout change.
+
+Switching files in VS Code while the window layout stays identical produces separate files:
+
+```
+my_video_scenes/
+  scene_index.json                  ← all scene metadata with visit counts
+  scene_001_vscode_auth_py.jsonl    ← turns while auth.py was active
+  scene_002_vscode_models_py.jsonl  ← turns while models.py was active
+```
+
+Each `.jsonl` line: `{"t": 1.23, "text": "def authenticate(token):"}`.
+
+### Choosing a good anchor string
+
+| Good | Bad |
+|---|---|
+| Window title: `"VS Code"`, `"Terminal"` | Long phrases (OCR errors multiply) |
+| Tab name: `"auth.py"`, `"main.py"` | Words that appear in scrolling content |
+| Fixed header: `"Dashboard"` | Text that changes during the recording |
+
+If the anchor keeps missing: lower `--fuzzy` (e.g. `0.6`), add `--search-region`, or try `--frame 30` in `calibrate_anchor.py`.
+
+### Requirements
+
+```bash
+pip install opencv-python pytesseract
+brew install tesseract   # macOS
+# or: apt install tesseract-ocr   (Linux)
+```
+
+---
 
 ## Source Code Minifier
 
@@ -213,8 +292,9 @@ Use `eval/token_tester.py` to get exact Claude token counts (via the `/v1/messag
 - `fastapi`, `uvicorn`, `httpx`, `numpy`, `tiktoken` (all in `requirements.txt`)
 - `sentence-transformers` — optional but strongly recommended for real semantic deduplication and eigencontext. Without it, embeddings fall back to a deterministic lexical-hash vector (catches near-duplicates but not deep semantic similarity).
 - `Pillow` — optional, required for the `image_compress` stage. Without it that stage self-disables gracefully.
-- `pytesseract` + Tesseract binary — optional, required for `image.ocr_enabled=true` with the default backend. Fast, good for clean terminal/code screenshots. Install: `pip install pytesseract` and `brew install tesseract` (macOS) or `apt install tesseract-ocr` (Linux).
-- `easyocr` — optional alternative OCR backend. Slower, higher accuracy on mixed layouts, no binary dependency. Install: `pip install easyocr`.
+- `pytesseract` + Tesseract binary — optional, required for `image.ocr_enabled=true` and for video transcription. Fast, good for clean terminal/code screenshots. Install: `pip install pytesseract` and `brew install tesseract` (macOS) or `apt install tesseract-ocr` (Linux).
+- `easyocr` — optional alternative OCR backend for both image and video stages. Slower, higher accuracy on mixed layouts, no binary dependency. Install: `pip install easyocr`.
+- `opencv-python` — optional, required for the `video_compress` stage and the standalone video transcription scripts. Install: `pip install opencv-python`.
 
 ## Install
 
@@ -308,6 +388,22 @@ Key knobs:
 | `image.zone_h_threshold` | `20` | RLSA horizontal gap threshold. Higher values merge words into longer blobs. Lower for tightly spaced content; higher for wide-column web pages. |
 | `image.zone_v_threshold` | `30` | RLSA vertical gap threshold. Higher values merge lines into paragraphs. |
 | `image.zone_min_zone_area` | `2000` | Minimum pixel area for a detected zone to be kept. Filters noise blobs. |
+| `video.enabled` | `false` | Enable video-to-text conversion (requires `opencv-python` and an OCR backend). |
+| `video.protect_last_n_messages` | `4` | Leave video blocks in the most recent N messages untouched. |
+| `video.roi` | `null` | Fixed content region `[x, y, w, h]`. `null` = auto-detect or full frame. |
+| `video.stabilize` | `false` | Use optical-flow drift correction when `roi` is fixed. |
+| `video.anchor_text` | `""` | UI string to locate via OCR each N frames (e.g. `"VS Code"`). Takes priority over `roi` when set. |
+| `video.offset_y` | `28` | Pixels below the bottom of the anchor text where the scrolling content begins. |
+| `video.offset_x` | `0` | Pixels right of the anchor's left edge where content begins. |
+| `video.content_height` | `0` | Fixed height of the content region in pixels. `0` = to frame bottom. |
+| `video.content_width` | `0` | Fixed width of the content region in pixels. `0` = to frame right edge. |
+| `video.search_region` | `null` | Restrict anchor OCR to `[x, y, w, h]`. Cuts OCR time by ~90% when the anchor's location is known. |
+| `video.redetect_every` | `15` | Re-run anchor OCR every N frames. Lower = more accurate, slower. |
+| `video.fuzzy_threshold` | `0.7` | Minimum character-match ratio to accept an OCR result as the anchor. `1.0` = exact; `0.6` = tolerates OCR noise. |
+| `video.ocr_backend` | `"tesseract"` | OCR engine: `"tesseract"` (fast, needs the binary) or `"easyocr"` (slower, higher accuracy, no binary). |
+| `video.ocr_every_n_frames` | `5` | Run content OCR every N frames. |
+| `video.change_threshold` | `0.15` | Minimum text-difference ratio to emit a new segment (avoids near-duplicate lines). |
+| `video.max_frames` | `0` | Stop after this many frames. `0` = process the entire video. |
 
 Environment overrides: `CCOMP_UPSTREAM`, `CCOMP_HOST`, `CCOMP_PORT`, `CCOMP_METRICS`, `CCOMP_LOG_LEVEL`.
 
@@ -364,6 +460,8 @@ For **image-heavy or computer-use sessions**, enable `image.enabled` and set `im
 For sessions with **terminal output, stack traces, or code editor screenshots** (classified as `document_text`), enable `image.ocr_enabled` for 75–90% savings compared to downscaling. OCR converts the image block to a plain-text block that benefits from all existing text stages (dedup, checkpoint). Install pytesseract first (`pip install pytesseract && brew install tesseract`). If the image is misclassified or OCR output is too noisy, the stage falls back to normal downscaling automatically.
 
 For **IDE screenshots or browser pages** with mixed content (code editor + sidebar + terminal, or article + navigation), enable `image.zone_segment`. RLSA splits the image into typed regions before compressing. A code zone gets OCR'd (if `ocr_enabled`); a diagram zone gets downscaled; the result is multiple smaller blocks instead of one large image. Zone segmentation works on both light-background documents and dark-background terminal / dark-mode editor screenshots — the binarizer auto-inverts when the foreground and background are reversed. RLSA is vectorized and images are pre-scaled to 800px before zone detection, so even 4K screenshots are handled quickly. Tune `zone_h_threshold` (15–25) and `zone_v_threshold` (20–40) if zones are over-merged or over-split.
+
+For sessions where a **screen-recording is the input**, pass the video as a `type: "video"` content block and enable `video.enabled`. Set `video.anchor_text` to a distinctive string visible in the static UI chrome (window title, tab name). If anchor detection is slow, add `video.search_region` to restrict where Tesseract looks — a narrow strip covering the tab bar reduces OCR time by ~90%. Run `calibrate_anchor.py` first to verify the anchor and offsets before processing a long video. For the standalone workflow (no proxy), use `video_transcribe_roi.py` directly; pipe its output into a new Claude session as context.
 
 ## Contributing
 
